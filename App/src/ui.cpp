@@ -100,6 +100,8 @@ static RECT g_updateBadgeR{};
 static bool g_hoverUpdate = false;
 static bool g_updateDown = false;
 
+static bool g_windowActive = true;
+
 static HICON g_icon32 = NULL;
 static HICON g_icon16 = NULL;
 static HICON g_iconTray = NULL;
@@ -149,6 +151,16 @@ static void EnableDarkMode(HWND h) {
     DwmSetWindowAttribute(h, 2, &ncrp, sizeof(ncrp)); // DWMWA_NCRENDERING_POLICY
     MARGINS m{ 0, 0, 0, 1 };
     DwmExtendFrameIntoClientArea(h, &m); // keep a native drop shadow on the borderless window
+}
+
+// DWM's own 1px window-edge accent (independent of WM_NCPAINT/our custom
+// caption) otherwise falls back to the system's default light/white
+// inactive-window border, clashing with the dark theme. Drive it ourselves:
+// gold while focused, hidden while not. Windows 11 only (22H2+); silently
+// no-ops on older systems.
+static void SetBorderActive(HWND h, bool active) {
+    COLORREF col = active ? C_GOLD : (COLORREF)0xFFFFFFFE /* DWMWA_COLOR_NONE */;
+    DwmSetWindowAttribute(h, 34, &col, sizeof(col)); // DWMWA_BORDER_COLOR
 }
 
 static bool IsWndMaximized(HWND h) { return IsZoomed(h) != FALSE; }
@@ -504,6 +516,24 @@ static void DrawUpdateBadge(HDC dc) {
     SelectObject(dc, of);
 }
 
+// The window has no native frame at all (WS_POPUP, no WS_CAPTION) so DWM
+// never draws a border of its own -- draw the focused-state accent
+// ourselves, right on the outer edge of the client area, and simply skip it
+// while unfocused.
+static void DrawActiveBorder(HDC dc, HWND hwnd) {
+    if (!g_windowActive) return;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int w = std::max(1, (int)(1.5 * (g_dpi / 96.0) + 0.5));
+    HPEN pen = CreatePen(PS_SOLID, w, C_GOLD);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, 0, 0, rc.right, rc.bottom);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
 // ---------------------------------------------------------------------------
 // Main window painting
 // ---------------------------------------------------------------------------
@@ -617,6 +647,7 @@ static void PaintMain(HWND hwnd) {
 
     DrawCaption(mem, hwnd);
     if (g_updateAvailable) DrawUpdateBadge(mem);
+    DrawActiveBorder(mem, hwnd);
 
     BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldB);
@@ -635,6 +666,7 @@ static void PaintSettingsBg(HWND hwnd) {
     FillRect(dc, &rc, g_brDlg);
     DrawCaption(dc, hwnd);
     if (g_updateAvailable) DrawUpdateBadge(dc);
+    DrawActiveBorder(dc, hwnd);
     EndPaint(hwnd, &ps);
 }
 
@@ -1068,6 +1100,7 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         g_hwnd = hwnd;
         EnableDarkMode(hwnd);
+        SetBorderActive(hwnd, true); // newly created window starts focused
         SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon32);
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_icon16);
         AddTrayIcon();
@@ -1370,7 +1403,30 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_NCACTIVATE:
+        SetBorderActive(hwnd, wp != FALSE);
         return DefWindowProcW(hwnd, msg, wp, -1);
+
+    case WM_ACTIVATE: {
+        bool active = LOWORD(wp) != WA_INACTIVE;
+        g_windowActive = active;
+        SetBorderActive(hwnd, active);
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    }
+
+    // WM_ACTIVATE can be unreliable for a WS_POPUP window with no caption;
+    // focus changes are the more robust signal for this style.
+    case WM_SETFOCUS:
+        g_windowActive = true;
+        SetBorderActive(hwnd, true);
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+
+    case WM_KILLFOCUS:
+        g_windowActive = false;
+        SetBorderActive(hwnd, false);
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
 
     case WM_NCPAINT:
         // The window keeps WS_CAPTION (for DWM's shadow/rounded corners and
@@ -1502,10 +1558,18 @@ int RunApp(HINSTANCE hinst) {
     RegisterClassW(&wc);
 
     double s = g_dpi / 96.0;
-    // No WS_MAXIMIZEBOX: the window can't be full-screened (no maximize
-    // button, no double-click-caption maximize, no Win+Up / drag-to-top snap).
+    // WS_POPUP instead of WS_OVERLAPPEDWINDOW: no WS_CAPTION at all, so
+    // there's no native title bar for DWM to ever fall back to drawing
+    // (it otherwise still painted its own default light caption -- with a
+    // maximize button we don't even have -- whenever the window lost focus,
+    // no matter how much WM_NCPAINT/WM_NCACTIVATE suppression was added).
+    // WS_THICKFRAME keeps resizing (driven by our own WM_NCHITTEST), and
+    // WS_SYSMENU + WS_MINIMIZEBOX keep the taskbar/Alt+Tab/system-menu
+    // behavior working. No WS_MAXIMIZEBOX: the window can't be
+    // full-screened (no maximize button, no double-click-caption maximize,
+    // no Win+Up / drag-to-top snap).
     g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"GXGoldWnd", L"GX Gold Export",
-                             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
+                             WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              (int)(520 * s), (int)(470 * s),
                              NULL, NULL, hinst, NULL);

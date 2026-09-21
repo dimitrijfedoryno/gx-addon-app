@@ -24,7 +24,7 @@ cl /nologo /std:c++17 /O2 /EHsc /W3 /utf-8 ^
    /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS ^
    /I"res" ^
    /Fo"build\\" /Fd"build\\GXMon.pdb" ^
-   src\main.cpp src\ui.cpp src\watch.cpp src\app.cpp ^
+   src\main.cpp src\ui.cpp src\watch.cpp src\app.cpp src\update.cpp ^
    /link /OUT:"GXMonitor.exe" ^
    user32.lib gdi32.lib shell32.lib shlwapi.lib comctl32.lib comdlg32.lib ^
    dwmapi.lib ole32.lib advapi32.lib build\app.res /SUBSYSTEM:WINDOWS

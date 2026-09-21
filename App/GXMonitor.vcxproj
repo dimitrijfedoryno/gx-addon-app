@@ -100,6 +100,8 @@
     <ClInclude Include="src\app.h" />
     <ClInclude Include="src\ui.h" />
     <ClInclude Include="src\watch.h" />
+    <ClInclude Include="src\update.h" />
+    <ClInclude Include="src\version.h" />
     <ClInclude Include="res\resource.h" />
   </ItemGroup>
   <ItemGroup>
@@ -107,6 +109,7 @@
     <ClCompile Include="src\app.cpp" />
     <ClCompile Include="src\ui.cpp" />
     <ClCompile Include="src\watch.cpp" />
+    <ClCompile Include="src\update.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="res\app.rc" />

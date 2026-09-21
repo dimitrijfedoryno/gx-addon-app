@@ -46,12 +46,33 @@ Tento soubor sleduje dvě samostatně verzované části repozitáře: WoW addon
   2K) občas nechalo v Nastavení text starého (špatného) DPI přes nově
   přepočítaný layout. Písmo ovládacích prvků se teď při změně DPI vždy znovu
   vytvoří a přiřadí.
+- **Oprava:** i přes vlastní `WM_NCCALCSIZE` si okno ponechávalo systémový
+  styl `WS_CAPTION` (kvůli stínu a zaobleným rohům), takže DWM přes vlastní
+  titulkový pruh appky ještě kreslil svůj nativní — vypadalo to jako dva
+  title bary nad sebou. Opraveno explicitním potlačením non-client
+  vykreslování (`WM_NCPAINT` + `DWMWA_NCRENDERING_POLICY`).
+
+### Aktualizace aplikace
+
+- **Verze v title baru** — vedle názvu okna se teď zobrazuje aktuální verze
+  (`v1.0.0`).
+- **Automatický updater** — když je na GitHubu (`dimitrijfedoryno/gx-addon-app`)
+  dostupný novější release, objeví se pod titulkovým pruhem vpravo nahoře
+  malý zlatý odznak „Update". Klik stáhne a nainstaluje nový build **bez
+  zásahu uživatele** — appka se sama restartuje do nové verze (žádné ruční
+  stahování ani rozbalování souborů). Kontrola běží na pozadí při startu a
+  pak jednou za 6 hodin.
+  > Aby updater něco našel, je potřeba na GitHubu vytvořit Release s tagem
+  > `vX.Y.Z` a přiloženým `GXMonitor.exe` jako asset.
 
 ### Technické změny
 
 - Přidány projektové soubory pro Visual Studio (`App/GXMonitor.sln`,
   `App/GXMonitor.vcxproj`) vedle stávajícího `build.bat` pro příkazovou řádku
   (MSVC).
+- Nové soubory `App/src/update.cpp` / `update.h` (WinHTTP dotaz na GitHub
+  Releases API, stažení assetu, výměna běžícího `.exe` přes odpojený dávkový
+  skript) a `App/src/version.h` (`GX_APP_VERSION` + repo pro updater).
 
 ---
 

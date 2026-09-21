@@ -4,6 +4,8 @@
 #include "ui.h"
 #include "watch.h"
 #include "app.h"
+#include "update.h"
+#include "version.h"
 #include "..\res\resource.h"
 
 #include <windowsx.h>
@@ -16,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <thread>
 #include <cstdio>
 #include <objidl.h>
 #include <gdiplus.h>
@@ -55,6 +58,8 @@ static const COLORREF C_CAPICON = RGB(0x9A, 0xA1, 0xAC);
 
 #define WM_APP_GOLD (WM_APP + 1)
 #define WM_APP_ICON (WM_APP + 2)
+#define WM_APP_UPDATE_PROGRESS (WM_APP + 3)
+#define WM_APP_UPDATE_DONE (WM_APP + 4)
 
 // ---------------------------------------------------------------------------
 // State
@@ -84,6 +89,16 @@ static int g_capH = 36;
 static RECT g_capMinR{}, g_capCloseR{};
 static int g_hoverCap = -1;
 static int g_capDown = -1;
+
+// In-app updater. The badge sits just under the caption row, right-aligned.
+static std::mutex g_updateMu;
+static bool g_updateAvailable = false;
+static bool g_updating = false;
+static UpdateInfo g_updateInfo;
+static std::wstring g_updateStatus;
+static RECT g_updateBadgeR{};
+static bool g_hoverUpdate = false;
+static bool g_updateDown = false;
 
 static HICON g_icon32 = NULL;
 static HICON g_icon16 = NULL;
@@ -130,6 +145,8 @@ static void EnableDarkMode(HWND h) {
     DwmSetWindowAttribute(h, 20, &on, sizeof(on)); // DWMWA_USE_IMMERSIVE_DARK_MODE
     DWORD corner = 2; // DWMWCP_ROUND
     DwmSetWindowAttribute(h, 33, &corner, sizeof(corner)); // DWMWA_WINDOW_CORNER_PREFERENCE
+    DWORD ncrp = 1; // DWMNCRP_DISABLED
+    DwmSetWindowAttribute(h, 2, &ncrp, sizeof(ncrp)); // DWMWA_NCRENDERING_POLICY
     MARGINS m{ 0, 0, 0, 1 };
     DwmExtendFrameIntoClientArea(h, &m); // keep a native drop shadow on the borderless window
 }
@@ -168,6 +185,11 @@ static void ComputeCaptionRects(HWND hwnd) {
     // the custom title bar, so only minimize and close remain.
     g_capCloseR = { full.right - btnW, 0, full.right, g_capH };
     g_capMinR   = { g_capCloseR.left - btnW, 0, g_capCloseR.left, g_capH };
+
+    // Update badge: a small pill just under the caption row, right-aligned.
+    int upW = (int)(84 * s), upH = (int)(24 * s);
+    int upTop = g_capH + (int)(8 * s);
+    g_updateBadgeR = { full.right - (int)(12 * s) - upW, upTop, full.right - (int)(12 * s), upTop + upH };
 }
 
 static int CapHitTest(int x, int y) {
@@ -175,6 +197,12 @@ static int CapHitTest(int x, int y) {
     if (PtInRect(&g_capMinR, p)) return 0;
     if (PtInRect(&g_capCloseR, p)) return 2;
     return -1;
+}
+
+static bool UpdateBadgeHit(int x, int y) {
+    if (!g_updateAvailable || g_updating) return false;
+    POINT p{ x, y };
+    return PtInRect(&g_updateBadgeR, p) != FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,8 +473,35 @@ static void DrawCaption(HDC dc, HWND hwnd) {
     RECT titleR = { padL + iconSz + (int)(8 * s), 0, g_capMinR.left - (int)(8 * s), g_capH };
     DrawTxt(dc, titleR, title, g_fCaption, C_TXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
+    HGDIOBJ prevF = SelectObject(dc, g_fCaption);
+    SIZE titleSz{};
+    GetTextExtentPoint32W(dc, title, (int)wcslen(title), &titleSz);
+    SelectObject(dc, prevF);
+
+    RECT verR = titleR;
+    verR.left = std::min(titleR.left + titleSz.cx + (int)(6 * s), titleR.right);
+    DrawTxt(dc, verR, L"v" GX_APP_VERSION, g_fTiny, C_FAINT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
     DrawCapButton(dc, g_capMinR, 0, g_hoverCap == 0);
     DrawCapButton(dc, g_capCloseR, 2, g_hoverCap == 2);
+}
+
+static void DrawUpdateBadge(HDC dc) {
+    int r = (g_updateBadgeR.bottom - g_updateBadgeR.top) / 2;
+    HRGN rg = CreateRoundRectRgn(g_updateBadgeR.left, g_updateBadgeR.top,
+                                 g_updateBadgeR.right, g_updateBadgeR.bottom, r, r);
+    HBRUSH fb = CreateSolidBrush(g_hoverUpdate ? C_GOLD : C_GOLDMUTE);
+    FillRgn(dc, rg, fb);
+    DeleteObject(fb);
+    DeleteObject(rg);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(0x1A, 0x1D, 0x24));
+    HGDIOBJ of = SelectObject(dc, g_fBtn);
+    RECT tr = g_updateBadgeR;
+    DrawTextW(dc, g_updating ? L"Updating\x2026" : L"Update", -1, &tr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, of);
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +596,10 @@ static void PaintMain(HWND hwnd) {
 
     RECT statusText = g_layout.statusL;
     statusText.left += dotSize + (int)(8.0 * g_dpi / 96.0 * g_sizeScale);
-    std::wstring statusLine = paused ? L"Paused" : (status.empty() ? L"Starting\x2026" : status);
+    std::wstring updateStatus;
+    { std::lock_guard<std::mutex> lk(g_updateMu); if (g_updating) updateStatus = g_updateStatus; }
+    std::wstring statusLine = !updateStatus.empty() ? updateStatus
+                             : paused ? L"Paused" : (status.empty() ? L"Starting\x2026" : status);
     DrawTxt(mem, statusText, statusLine.c_str(), g_fSub, dotCol, DT_LEFT | DT_SINGLELINE);
 
     std::wstring right;
@@ -558,6 +616,7 @@ static void PaintMain(HWND hwnd) {
     DrawButton(mem, g_layout.btnOpen, L"Open output", g_hover == 2, g_btnDown == 2);
 
     DrawCaption(mem, hwnd);
+    if (g_updateAvailable) DrawUpdateBadge(mem);
 
     BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldB);
@@ -575,6 +634,7 @@ static void PaintSettingsBg(HWND hwnd) {
     ComputeCaptionRects(hwnd);
     FillRect(dc, &rc, g_brDlg);
     DrawCaption(dc, hwnd);
+    if (g_updateAvailable) DrawUpdateBadge(dc);
     EndPaint(hwnd, &ps);
 }
 
@@ -624,6 +684,72 @@ static void QuitApp() {
     Shell_NotifyIconW(NIM_DELETE, &nid);
     DestroyWindow(g_hwnd);
     PostQuitMessage(0);
+}
+
+// ---------------------------------------------------------------------------
+// In-app updater
+// ---------------------------------------------------------------------------
+static void StartUpdateDownload() {
+    UpdateInfo info;
+    {
+        std::lock_guard<std::mutex> lk(g_updateMu);
+        if (g_updating || !g_updateAvailable) return;
+        g_updating = true;
+        g_updateStatus = L"Downloading update\x2026";
+        info = g_updateInfo;
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+
+    std::thread([info]() {
+        wchar_t tempDir[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tempDir);
+        std::wstring dest = std::wstring(tempDir) + L"GXMonitor_update_" + info.version + L".exe";
+
+        bool ok = download_update(info.exeUrl, dest, [](long long got, long long total) {
+            std::lock_guard<std::mutex> lk(g_updateMu);
+            if (total > 0) {
+                int pct = (int)(got * 100 / total);
+                g_updateStatus = L"Downloading update\x2026 " + std::to_wstring(pct) + L"%";
+            } else {
+                g_updateStatus = L"Downloading update\x2026";
+            }
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, 0);
+        });
+
+        if (ok) {
+            {
+                std::lock_guard<std::mutex> lk(g_updateMu);
+                g_updateStatus = L"Installing update, restarting\x2026";
+            }
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, 0);
+            ok = apply_update_and_restart(dest);
+        }
+
+        if (ok) {
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_DONE, 0, 0);
+        } else {
+            std::lock_guard<std::mutex> lk(g_updateMu);
+            g_updating = false;
+            g_updateStatus = L"Update failed \x2014 try again later";
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, 0);
+        }
+    }).detach();
+}
+
+static void UpdateCheckThreadFn() {
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    for (;;) {
+        UpdateInfo info;
+        if (check_latest_release(info)) {
+            std::lock_guard<std::mutex> lk(g_updateMu);
+            if (!g_updating) {
+                g_updateAvailable = true;
+                g_updateInfo = info;
+            }
+        }
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, 0);
+        std::this_thread::sleep_for(std::chrono::hours(6));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1235,8 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         bool changed = false;
         int ch = CapHitTest(mx, my);
         if (ch != g_hoverCap) { g_hoverCap = ch; changed = true; }
+        bool uh = UpdateBadgeHit(mx, my);
+        if (uh != g_hoverUpdate) { g_hoverUpdate = uh; changed = true; }
         if (g_view != VIEW_SETTINGS) {
             int h = HitTest(mx, my);
             if (h != g_hover) { g_hover = h; changed = true; }
@@ -1120,16 +1248,23 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSELEAVE:
-        if (g_hover != -1 || g_btnDown != -1 || g_hoverCap != -1) {
+        if (g_hover != -1 || g_btnDown != -1 || g_hoverCap != -1 || g_hoverUpdate) {
             g_hover = -1;
             g_btnDown = -1;
             g_hoverCap = -1;
+            g_hoverUpdate = false;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
 
     case WM_LBUTTONDOWN: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (UpdateBadgeHit(mx, my)) {
+            g_updateDown = true;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         int ch = CapHitTest(mx, my);
         if (ch != -1) {
             g_capDown = ch;
@@ -1149,6 +1284,13 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONUP: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (g_updateDown) {
+            g_updateDown = false;
+            ReleaseCapture();
+            if (UpdateBadgeHit(mx, my)) StartUpdateDownload();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_capDown != -1) {
             int down = g_capDown;
             g_capDown = -1;
@@ -1183,6 +1325,7 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CAPTURECHANGED:
         g_btnDown = ACT_NONE;
         g_capDown = -1;
+        g_updateDown = false;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
 
@@ -1229,12 +1372,26 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCACTIVATE:
         return DefWindowProcW(hwnd, msg, wp, -1);
 
+    case WM_NCPAINT:
+        // The window keeps WS_CAPTION (for DWM's shadow/rounded corners and
+        // Aero-snap), so without this DWM still paints its own native
+        // caption strip on top, above our custom-drawn one.
+        return 0;
+
     case WM_APP_GOLD:
         OnGoldUpdate();
         return 0;
 
     case WM_APP_ICON:
         OnTrayIcon(wp, lp);
+        return 0;
+
+    case WM_APP_UPDATE_PROGRESS:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_APP_UPDATE_DONE:
+        QuitApp();
         return 0;
 
     case WM_DPICHANGED: {
@@ -1355,6 +1512,7 @@ int RunApp(HINSTANCE hinst) {
     if (!g_hwnd) return 1;
 
     g_watcher.start(g_exeDir, g_settings.wc, WatcherCallback);
+    std::thread(UpdateCheckThreadFn).detach();
 
     if (g_settings.startMinimized) {
         ShowWindow(g_hwnd, SW_HIDE);

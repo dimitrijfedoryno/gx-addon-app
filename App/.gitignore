@@ -6,6 +6,10 @@ GXMonitor.exe.manifest
 # Build artifacts
 build/
 
+# Visual Studio local/IDE files
+.vs/
+*.vcxproj.user
+
 # Runtime-generated
 GX_Monitor.ini
 gx_debug.log

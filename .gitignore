@@ -20,6 +20,10 @@ WTF/
 # Generated output
 totalgold.txt
 
+# Packaged addon distribution archives (build from GX/ locally when needed)
+GX.zip
+GX_default.zip
+
 # IDE / Editor
 .vscode/
 .idea/

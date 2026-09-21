@@ -17,6 +17,8 @@
 #include <vector>
 #include <mutex>
 #include <cstdio>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -26,6 +28,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---------------------------------------------------------------------------
@@ -45,6 +48,10 @@ static const COLORREF C_GRN    = RGB(0x4C, 0xD9, 0x64);
 static const COLORREF C_AMB    = RGB(0xE8, 0xC0, 0x5F);
 static const COLORREF C_RED    = RGB(0xE0, 0x5C, 0x5C);
 static const COLORREF C_EDITBG = RGB(0x20, 0x24, 0x2E);
+static const COLORREF C_GOLDMUTE = RGB(0xB0, 0x92, 0x54);
+static const COLORREF C_KNOB   = RGB(0xF5, 0xF3, 0xEE);
+static const COLORREF C_CAPHOV  = RGB(0x2A, 0x30, 0x3B);
+static const COLORREF C_CAPICON = RGB(0x9A, 0xA1, 0xAC);
 
 #define WM_APP_GOLD (WM_APP + 1)
 #define WM_APP_ICON (WM_APP + 2)
@@ -54,6 +61,7 @@ static const COLORREF C_EDITBG = RGB(0x20, 0x24, 0x2E);
 // ---------------------------------------------------------------------------
 static HINSTANCE g_hinst = NULL;
 static HWND g_hwnd = NULL;
+static HANDLE g_singleMutex = NULL;
 static Watcher g_watcher;
 static Settings g_settings;
 static std::wstring g_exeDir;
@@ -69,6 +77,13 @@ static bool g_paused = false;
 static int g_hover = -1;
 static int g_btnDown = -1;
 static int g_dpi = 96;
+static double g_sizeScale = 1.0;
+
+// Custom title bar (no default Windows caption).
+static int g_capH = 36;
+static RECT g_capMinR{}, g_capCloseR{};
+static int g_hoverCap = -1;
+static int g_capDown = -1;
 
 static HICON g_icon32 = NULL;
 static HICON g_icon16 = NULL;
@@ -113,6 +128,53 @@ static int GetDpiOf(HWND h) {
 static void EnableDarkMode(HWND h) {
     BOOL on = TRUE;
     DwmSetWindowAttribute(h, 20, &on, sizeof(on)); // DWMWA_USE_IMMERSIVE_DARK_MODE
+    DWORD corner = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(h, 33, &corner, sizeof(corner)); // DWMWA_WINDOW_CORNER_PREFERENCE
+    MARGINS m{ 0, 0, 0, 1 };
+    DwmExtendFrameIntoClientArea(h, &m); // keep a native drop shadow on the borderless window
+}
+
+static bool IsWndMaximized(HWND h) { return IsZoomed(h) != FALSE; }
+
+// Combined DPI + window-size scale factor: layout, fonts and paddings all
+// shrink/grow together so the UI stays legible from the minimum window size
+// up through large/high-DPI windows, not just across DPI changes.
+static double ComputeSizeScale(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    double dpiS = GetDpiOf(hwnd) / 96.0;
+    double designW = 520.0 * dpiS;
+    double designH = 470.0 * dpiS;
+    double w = (double)std::max(1L, rc.right);
+    double h = (double)std::max(1L, rc.bottom);
+    double f = std::min(w / designW, h / designH);
+    return std::clamp(f, 0.72, 1.6);
+}
+
+static double UiScale(HWND hwnd) {
+    return (GetDpiOf(hwnd) / 96.0) * ComputeSizeScale(hwnd);
+}
+
+// Caption bar height/buttons scale with DPI only (not window-size scale) so
+// they stay a consistent, clickable physical size even when the window is
+// shrunk down.
+static void ComputeCaptionRects(HWND hwnd) {
+    RECT full;
+    GetClientRect(hwnd, &full);
+    double s = GetDpiOf(hwnd) / 96.0;
+    g_capH = (int)(36 * s);
+    int btnW = (int)(46 * s);
+    // No maximize button: the window can't be maximized/full-screened from
+    // the custom title bar, so only minimize and close remain.
+    g_capCloseR = { full.right - btnW, 0, full.right, g_capH };
+    g_capMinR   = { g_capCloseR.left - btnW, 0, g_capCloseR.left, g_capH };
+}
+
+static int CapHitTest(int x, int y) {
+    POINT p{ x, y };
+    if (PtInRect(&g_capMinR, p)) return 0;
+    if (PtInRect(&g_capCloseR, p)) return 2;
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,17 +185,22 @@ static HFONT g_fCaption = NULL, g_fBig = NULL, g_fValue = NULL,
 static int g_fontDpi = 0;
 
 static HFONT MakeFontPt(int pt, int weight) {
-    int px = (int)((pt * (double)g_dpi) / 72.0 + 0.5);
+    int px = (int)((pt * (double)g_dpi) / 72.0 * g_sizeScale + 0.5);
     return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
+static int g_fontScaleKey = -1;
+
 static void EnsureFonts(HWND hwnd) {
     int dpi = GetDpiOf(hwnd);
-    if (g_fontDpi && g_fontDpi == dpi) return;
+    double sizeScale = ComputeSizeScale(hwnd);
+    int key = dpi * 1000 + (int)(sizeScale * 100 + 0.5);
+    if (g_fontScaleKey == key) return;
     g_dpi = dpi;
-    if (g_fontDpi) {
+    g_sizeScale = sizeScale;
+    if (g_fontScaleKey != -1) {
         DeleteObject(g_fCaption); DeleteObject(g_fBig);
         DeleteObject(g_fValue);  DeleteObject(g_fSub);
         DeleteObject(g_fTiny);   DeleteObject(g_fBtn);
@@ -144,6 +211,7 @@ static void EnsureFonts(HWND hwnd) {
     g_fSub     = MakeFontPt(8, FW_NORMAL);
     g_fTiny    = MakeFontPt(8, FW_NORMAL);
     g_fBtn     = MakeFontPt(9, FW_NORMAL);
+    g_fontScaleKey = key;
     g_fontDpi = dpi;
 }
 
@@ -168,21 +236,22 @@ struct Layout {
 static Layout g_layout;
 
 static void ComputeLayout(HWND hwnd) {
+    ComputeCaptionRects(hwnd);
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int dpi = GetDpiOf(hwnd);
-    double s = dpi / 96.0;
+    double s = UiScale(hwnd);
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
+    int capH = g_capH;
 
     Layout L;
-    L.bigCard = { pad, (int)(12 * s), W - pad, (int)(116 * s) };
+    L.bigCard = { pad, capH + (int)(12 * s), W - pad, capH + (int)(128 * s) };
     L.bigCap  = { L.bigCard.left + (int)(20 * s), L.bigCard.top + (int)(12 * s),
                   L.bigCard.right - (int)(20 * s), L.bigCard.top + (int)(30 * s) };
     L.bigVal  = { L.bigCap.left, L.bigCard.top + (int)(28 * s),
                   L.bigCap.right, L.bigCard.top + (int)(86 * s) };
     L.bigSub  = { L.bigCap.left, L.bigCard.top + (int)(88 * s),
-                  L.bigCap.right, L.bigCard.bottom - (int)(6 * s) };
+                  L.bigCap.right, L.bigCard.bottom - (int)(12 * s) };
 
     int gap = (int)(12 * s);
     int cw  = (W - 2 * pad - gap) / 2;
@@ -238,15 +307,15 @@ static void DrawCard(HDC dc, const RECT& rc, COLORREF fill, COLORREF edge) {
 
 static void DrawButton(HDC dc, const RECT& rc, const wchar_t* text,
                        bool hover, bool pressed) {
+    double s = (g_dpi / 96.0) * g_sizeScale;
     COLORREF bg = pressed ? C_BTNP : (hover ? C_BTNH : C_BTN);
-    int r = 0;
-    if (rc.bottom > rc.top) r = (rc.bottom - rc.top) / 2;
+    int r = std::max(6, (int)(10 * s));
     HRGN rg = CreateRoundRectRgn(rc.left, rc.top, rc.right, rc.bottom, r, r);
     HBRUSH fb = CreateSolidBrush(bg);
     FillRgn(dc, rg, fb);
     DeleteObject(fb);
 
-    HPEN pen = CreatePen(PS_SOLID, 1, hover ? C_GOLD : C_EDGE);
+    HPEN pen = CreatePen(PS_SOLID, 1, hover ? C_GOLD : C_GOLDMUTE);
     HGDIOBJ op = SelectObject(dc, pen);
     HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, r, r);
@@ -256,7 +325,7 @@ static void DrawButton(HDC dc, const RECT& rc, const wchar_t* text,
     DeleteObject(rg);
 
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, hover ? C_TXT : C_DIM);
+    SetTextColor(dc, hover ? C_GOLD : C_GOLDMUTE);
     HGDIOBJ of = SelectObject(dc, g_fBtn);
     RECT rr = rc;
     DrawTextW(dc, text, -1, &rr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -277,41 +346,107 @@ static void DrawCheckbox(HDC dc, const RECT& rc, const wchar_t* text, bool check
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
 
-    double s = g_dpi / 96.0;
-    int boxSz = (int)(14 * s);
-    int gap   = (int)(8 * s);
-    int vy    = rc.top + (rc.bottom - rc.top - boxSz) / 2;
-    RECT box  = { rc.left, vy, rc.left + boxSz, vy + boxSz };
+    double s = (g_dpi / 96.0) * g_sizeScale;
 
-    // Outer border
-    HPEN pen = CreatePen(PS_SOLID, 1, checked ? C_GOLD : C_EDGE);
-    HBRUSH br = CreateSolidBrush(checked ? C_EDITBG : C_EDITBG);
-    HGDIOBJ op = SelectObject(dc, pen);
-    HGDIOBJ ob = SelectObject(dc, br);
-    RoundRect(dc, box.left, box.top, box.right, box.bottom, 3, 3);
-    DeleteObject(SelectObject(dc, ob));
-    SelectObject(dc, op);
-    DeleteObject(pen);
+    // Toggle-switch track, right-aligned within the row. Drawn with GDI+
+    // (antialiased) instead of plain GDI RoundRect/Ellipse, which leaves
+    // visibly jagged/pixelated edges on curves at this small a size.
+    int trackW = (int)(34 * s);
+    int trackH = (int)(18 * s);
+    int vy     = rc.top + (rc.bottom - rc.top - trackH) / 2;
+    RECT track = { rc.right - trackW, vy, rc.right, vy + trackH };
 
-    // Checkmark
-    if (checked) {
-        HPEN cp = CreatePen(PS_SOLID, (int)(2.0 * s), C_GOLD);
-        HGDIOBJ ocp = SelectObject(dc, cp);
-        MoveToEx(dc, box.left + (int)(3 * s), box.top + boxSz / 2, NULL);
-        LineTo(dc, box.left + boxSz / 2 - (int)(1 * s), box.bottom - (int)(3 * s));
-        MoveToEx(dc, box.left + boxSz / 2 - (int)(1 * s), box.bottom - (int)(3 * s), NULL);
-        LineTo(dc, box.right - (int)(3 * s), box.top + (int)(3 * s));
-        SelectObject(dc, ocp);
-        DeleteObject(cp);
+    COLORREF trackCol = checked ? C_GOLD : C_BTN;
+    COLORREF edgeCol  = checked ? C_GOLD : C_EDGE;
+    int knobD = trackH - (int)(4 * s);
+    int knobY = track.top + (trackH - knobD) / 2;
+    int knobX = checked ? (track.right - knobD - (int)(2 * s)) : (track.left + (int)(2 * s));
+
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+        int d = trackH; // corner arc diameter -> full pill/stadium shape
+        float tx = (float)track.left, ty = (float)track.top;
+        float tw = (float)(track.right - track.left), th = (float)(track.bottom - track.top);
+        Gdiplus::GraphicsPath path;
+        path.AddArc(tx, ty, (float)d, (float)d, 180, 90);
+        path.AddArc(tx + tw - d, ty, (float)d, (float)d, 270, 90);
+        path.AddArc(tx + tw - d, ty + th - d, (float)d, (float)d, 0, 90);
+        path.AddArc(tx, ty + th - d, (float)d, (float)d, 90, 90);
+        path.CloseFigure();
+
+        Gdiplus::SolidBrush fillBrush(Gdiplus::Color(255,
+            GetRValue(trackCol), GetGValue(trackCol), GetBValue(trackCol)));
+        g.FillPath(&fillBrush, &path);
+        Gdiplus::Pen edgePen(Gdiplus::Color(255,
+            GetRValue(edgeCol), GetGValue(edgeCol), GetBValue(edgeCol)), 1.0f);
+        g.DrawPath(&edgePen, &path);
+
+        Gdiplus::SolidBrush knobBrush(Gdiplus::Color(255,
+            GetRValue(C_KNOB), GetGValue(C_KNOB), GetBValue(C_KNOB)));
+        g.FillEllipse(&knobBrush, (float)knobX, (float)knobY, (float)knobD, (float)knobD);
     }
 
-    // Label text
-    RECT trc = { box.right + gap, rc.top, rc.right, rc.bottom };
+    // Label text (left side, leaving room for the switch)
+    RECT trc = { rc.left, rc.top, track.left - (int)(10 * s), rc.bottom };
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, C_DIM);
     HGDIOBJ of = SelectObject(dc, g_fBtn);
     DrawTextW(dc, text, -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of);
+}
+
+static void DrawCapButton(HDC dc, const RECT& rc, int kind, bool hover) {
+    COLORREF bg = hover ? (kind == 2 ? C_RED : C_CAPHOV) : C_BG;
+    HBRUSH bgb = CreateSolidBrush(bg);
+    FillRect(dc, &rc, bgb);
+    DeleteObject(bgb);
+
+    double s = g_dpi / 96.0;
+    int cx = (rc.left + rc.right) / 2;
+    int cy = (rc.top + rc.bottom) / 2;
+    int half = (int)(5 * s);
+    COLORREF col = hover ? C_TXT : C_CAPICON;
+    int penW = std::max(1, (int)(1.2 * s));
+    HPEN pen = CreatePen(PS_SOLID, penW, col);
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    if (kind == 0) { // minimize
+        MoveToEx(dc, cx - half, cy, NULL);
+        LineTo(dc, cx + half, cy);
+    } else { // close
+        MoveToEx(dc, cx - half, cy - half, NULL); LineTo(dc, cx + half, cy + half);
+        MoveToEx(dc, cx + half, cy - half, NULL); LineTo(dc, cx - half, cy + half);
+    }
+
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+static void DrawCaption(HDC dc, HWND hwnd) {
+    RECT full;
+    GetClientRect(hwnd, &full);
+    RECT cap = { 0, 0, full.right, g_capH };
+    HBRUSH b = CreateSolidBrush(C_BG);
+    FillRect(dc, &cap, b);
+    DeleteObject(b);
+
+    double s = g_dpi / 96.0;
+    int iconSz = (int)(18 * s);
+    int padL = (int)(12 * s);
+    int iy = (g_capH - iconSz) / 2;
+    if (g_icon16) DrawIconEx(dc, padL, iy, g_icon16, iconSz, iconSz, 0, NULL, DI_NORMAL);
+
+    wchar_t title[128] = L"";
+    GetWindowTextW(hwnd, title, 128);
+    RECT titleR = { padL + iconSz + (int)(8 * s), 0, g_capMinR.left - (int)(8 * s), g_capH };
+    DrawTxt(dc, titleR, title, g_fCaption, C_TXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DrawCapButton(dc, g_capMinR, 0, g_hoverCap == 0);
+    DrawCapButton(dc, g_capCloseR, 2, g_hoverCap == 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +487,7 @@ static void PaintMain(HWND hwnd) {
     DrawCard(mem, g_layout.bigCard, C_PANEL, C_EDGE);
     DrawTxt(mem, g_layout.bigCap, L"ACCOUNT GOLD TOTAL", g_fCaption, C_DIM,
             DT_LEFT | DT_SINGLELINE);
-    std::wstring big = formatted.empty() ? L"â€”" : formatted;
+    std::wstring big = formatted.empty() ? L"\x2014" : formatted;
     DrawTxt(mem, g_layout.bigVal, big.c_str(), g_fBig, C_GOLD,
             DT_LEFT | DT_SINGLELINE);
     std::wstring sub;
@@ -392,8 +527,8 @@ static void PaintMain(HWND hwnd) {
     // Status row
     COLORREF dotCol = paused ? C_AMB
                      : (statusKind == STATUS_ERROR ? C_RED
-                        : statusKind == STATUS_WAITING ? C_AMB : C_GRN);
-    int dotSize = (int)(8.0 * g_dpi / 96.0);
+                        : statusKind == STATUS_WAITING ? C_AMB : C_GOLD);
+    int dotSize = (int)(8.0 * g_dpi / 96.0 * g_sizeScale);
     int midY = (g_layout.statusL.top + g_layout.statusL.bottom) / 2;
     HBRUSH dot = CreateSolidBrush(dotCol);
     HGDIOBJ op = SelectObject(mem, GetStockObject(NULL_PEN));
@@ -405,10 +540,9 @@ static void PaintMain(HWND hwnd) {
     DeleteObject(dot);
 
     RECT statusText = g_layout.statusL;
-    statusText.left += dotSize + (int)(8.0 * g_dpi / 96.0);
-    std::wstring statusLine = paused ? L"Paused" : (status.empty() ? L"Startingâ€¦" : status);
-    DrawTxt(mem, statusText, statusLine.c_str(), g_fSub,
-            paused ? C_AMB : C_DIM, DT_LEFT | DT_SINGLELINE);
+    statusText.left += dotSize + (int)(8.0 * g_dpi / 96.0 * g_sizeScale);
+    std::wstring statusLine = paused ? L"Paused" : (status.empty() ? L"Starting\x2026" : status);
+    DrawTxt(mem, statusText, statusLine.c_str(), g_fSub, dotCol, DT_LEFT | DT_SINGLELINE);
 
     std::wstring right;
     if (!formatted.empty())
@@ -423,6 +557,8 @@ static void PaintMain(HWND hwnd) {
     DrawButton(mem, g_layout.btnRefresh, L"Refresh", g_hover == 3, g_btnDown == 3);
     DrawButton(mem, g_layout.btnOpen, L"Open output", g_hover == 2, g_btnDown == 2);
 
+    DrawCaption(mem, hwnd);
+
     BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldB);
     DeleteObject(bmp);
@@ -435,7 +571,10 @@ static void PaintSettingsBg(HWND hwnd) {
     HDC dc = BeginPaint(hwnd, &ps);
     RECT rc;
     GetClientRect(hwnd, &rc);
+    EnsureFonts(hwnd);
+    ComputeCaptionRects(hwnd);
     FillRect(dc, &rc, g_brDlg);
+    DrawCaption(dc, hwnd);
     EndPaint(hwnd, &ps);
 }
 
@@ -507,11 +646,11 @@ static void UpdateTrayTip() {
     {
         std::lock_guard<std::mutex> lk(g_stateMu);
         if (g_paused)
-            tip = L"GX Gold Monitor â€” paused";
+            tip = L"GX Gold Monitor \x2014 paused";
         else if (g_formatted.empty())
-            tip = L"GX Gold Monitor â€” waiting for SavedVariables";
+            tip = L"GX Gold Monitor \x2014 waiting for SavedVariables";
         else
-            tip = L"GX â€” " + g_formatted;
+            tip = L"GX \x2014 " + g_formatted;
     }
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -657,21 +796,22 @@ static void ApplySettings() {
 }
 
 static void PositionSettingsControls(HWND hwnd) {
+    ComputeCaptionRects(hwnd);
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int dpi = GetDpiOf(hwnd);
-    double s = dpi / 96.0;
+    double s = UiScale(hwnd);
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
+    int capH = g_capH;
 
-    double fy = std::clamp((double)(H - 40 * s) / (320 * s), 0.7, 1.0);
+    double fy = std::clamp((double)(H - capH - 40 * s) / (320 * s), 0.7, 1.0);
     int rowH = (int)((14 + 4 + 24 + 6) * s * fy);
 
     int backH = (int)(28 * s);
-    MoveWindow(GetDlgItem(hwnd, IDC_BTN_BACK), pad, (int)(10 * s),
+    MoveWindow(GetDlgItem(hwnd, IDC_BTN_BACK), pad, capH + (int)(10 * s),
                (int)(72 * s), backH, TRUE);
 
-    int y = (int)(10 * s) + backH + (int)(8 * s);
+    int y = capH + (int)(10 * s) + backH + (int)(8 * s);
 
     auto Row = [&](int lbl, int ed, int btn, int btnW) {
         MoveWindow(GetDlgItem(hwnd, lbl), pad, y, W - 2 * pad, (int)(14 * s), TRUE);
@@ -732,10 +872,10 @@ static void CopyOutputPath() {
 }
 
 static void PositionOutputPath(HWND hwnd) {
+    ComputeCaptionRects(hwnd);
     RECT rc;
     GetClientRect(hwnd, &rc);
-    int dpi = GetDpiOf(hwnd);
-    double s = dpi / 96.0;
+    double s = UiScale(hwnd);
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
 
@@ -800,6 +940,7 @@ static void OnGoldUpdate() {
 static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
+        g_hwnd = hwnd;
         EnableDarkMode(hwnd);
         SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon32);
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_icon16);
@@ -964,28 +1105,40 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEMOVE: {
-        if (g_view == VIEW_SETTINGS) return 0;
-        int h = HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-        if (h != g_hover) {
-            g_hover = h;
-            InvalidateRect(hwnd, NULL, FALSE);
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        bool changed = false;
+        int ch = CapHitTest(mx, my);
+        if (ch != g_hoverCap) { g_hoverCap = ch; changed = true; }
+        if (g_view != VIEW_SETTINGS) {
+            int h = HitTest(mx, my);
+            if (h != g_hover) { g_hover = h; changed = true; }
         }
+        if (changed) InvalidateRect(hwnd, NULL, FALSE);
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
         return 0;
     }
 
     case WM_MOUSELEAVE:
-        if (g_hover != -1 || g_btnDown != -1) {
+        if (g_hover != -1 || g_btnDown != -1 || g_hoverCap != -1) {
             g_hover = -1;
             g_btnDown = -1;
+            g_hoverCap = -1;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
 
     case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        int ch = CapHitTest(mx, my);
+        if (ch != -1) {
+            g_capDown = ch;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_view == VIEW_SETTINGS) return 0;
-        int h = HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        int h = HitTest(mx, my);
         if (h != ACT_NONE) {
             g_btnDown = h;
             SetCapture(hwnd);
@@ -995,12 +1148,26 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_LBUTTONUP: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (g_capDown != -1) {
+            int down = g_capDown;
+            g_capDown = -1;
+            ReleaseCapture();
+            if (CapHitTest(mx, my) == down) {
+                switch (down) {
+                case 0: ShowWindow(hwnd, SW_MINIMIZE); break;
+                case 2: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_view == VIEW_SETTINGS) return 0;
         if (g_btnDown != ACT_NONE) {
             int down = g_btnDown;
             g_btnDown = ACT_NONE;
             ReleaseCapture();
-            if (HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)) == down) {
+            if (HitTest(mx, my) == down) {
                 switch (down) {
                 case ACT_SETTINGS: ShowSettingsView(); break;
                 case ACT_PAUSE: TogglePause(); UpdateTrayTip(); break;
@@ -1015,8 +1182,52 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CAPTURECHANGED:
         g_btnDown = ACT_NONE;
+        g_capDown = -1;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
+
+    case WM_NCCALCSIZE: {
+        if (wp) {
+            NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
+            if (IsWndMaximized(hwnd)) {
+                HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi{ sizeof(mi) };
+                if (mon && GetMonitorInfoW(mon, &mi)) {
+                    params->rgrc[0] = mi.rcWork;
+                }
+            }
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    case WM_NCHITTEST: {
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &pt);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        double s = GetDpiOf(hwnd) / 96.0;
+        int border = (int)(6 * s);
+        if (!IsWndMaximized(hwnd)) {
+            bool left = pt.x < border;
+            bool right = pt.x >= rc.right - border;
+            bool top = pt.y < border;
+            bool bottom = pt.y >= rc.bottom - border;
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top && pt.x < g_capMinR.left) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+        if (pt.y >= 0 && pt.y < g_capH && pt.x < g_capMinR.left) return HTCAPTION;
+        return HTCLIENT;
+    }
+
+    case WM_NCACTIVATE:
+        return DefWindowProcW(hwnd, msg, wp, -1);
 
     case WM_APP_GOLD:
         OnGoldUpdate();
@@ -1031,7 +1242,36 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowPos(hwnd, NULL, pr->left, pr->top,
                      pr->right - pr->left, pr->bottom - pr->top,
                      SWP_NOACTIVATE | SWP_NOZORDER);
-        InvalidateRect(hwnd, NULL, TRUE);
+
+        // Moving to a monitor with a different DPI only auto-rescales the
+        // window's own custom-drawn content (refreshed lazily by
+        // EnsureFonts on next paint). The settings-view child controls
+        // (static labels, edit boxes) keep whatever font g_fntUi was built
+        // with at creation time unless we rebuild and rebind it here --
+        // otherwise their old-DPI-sized text overflows the newly-resized
+        // (new-DPI-sized) control rects and leaves ghosted remnants.
+        EnsureFonts(hwnd);
+        HFONT oldUi = g_fntUi;
+        g_fntUi = MakeFontPt(9, FW_NORMAL);
+        const int uiFontIds[] = {
+            IDC_BTN_BACK, IDC_LBL_FILE, IDC_ED_FILE, IDC_BTN_BROWSE_GX,
+            IDC_LBL_ACCT, IDC_ED_ACCT, IDC_BTN_DETECT,
+            IDC_LBL_OUT, IDC_ED_OUT, IDC_BTN_BROWSE_OUT,
+            IDC_LBL_POLL, IDC_ED_POLL,
+            IDC_CHK_RAW, IDC_CHK_MIN, IDC_CHK_RUN, IDC_BTN_SAVE,
+            IDC_ED_OUTPATH, IDC_BTN_COPY
+        };
+        for (int id : uiFontIds) {
+            HWND c = GetDlgItem(hwnd, id);
+            if (c) SendMessageW(c, WM_SETFONT, (WPARAM)g_fntUi, TRUE);
+        }
+        if (oldUi) DeleteObject(oldUi);
+
+        ComputeLayout(hwnd);
+        PositionSettingsControls(hwnd);
+        PositionOutputPath(hwnd);
+        RedrawWindow(hwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         return 0;
     }
 
@@ -1050,7 +1290,28 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ---------------------------------------------------------------------------
 int RunApp(HINSTANCE hinst) {
     g_hinst = hinst;
+
+    // Prevent multiple instances: a named mutex is held for the whole process.
+    // If another instance already owns it, focus that window and exit.
+    g_singleMutex = CreateMutexW(NULL, FALSE, L"Local\\GXGoldMonitorMutex");
+    if (!g_singleMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"GXGoldWnd", NULL);
+        if (existing) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        if (g_singleMutex) {
+            CloseHandle(g_singleMutex);
+            g_singleMutex = NULL;
+        }
+        return 0;
+    }
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    ULONG_PTR gdipToken = 0;
+    Gdiplus::GdiplusStartupInput gdipInput;
+    Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, NULL);
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -1084,8 +1345,10 @@ int RunApp(HINSTANCE hinst) {
     RegisterClassW(&wc);
 
     double s = g_dpi / 96.0;
-    g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"GXGoldWnd", L"GX â€” Gold Export",
-                             WS_OVERLAPPEDWINDOW,
+    // No WS_MAXIMIZEBOX: the window can't be full-screened (no maximize
+    // button, no double-click-caption maximize, no Win+Up / drag-to-top snap).
+    g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"GXGoldWnd", L"GX Gold Export",
+                             WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              (int)(520 * s), (int)(470 * s),
                              NULL, NULL, hinst, NULL);
@@ -1125,5 +1388,10 @@ int RunApp(HINSTANCE hinst) {
         DeleteObject(g_fValue); DeleteObject(g_fSub);
         DeleteObject(g_fTiny); DeleteObject(g_fBtn);
     }
+    if (g_singleMutex) {
+        CloseHandle(g_singleMutex);
+        g_singleMutex = NULL;
+    }
+    if (gdipToken) Gdiplus::GdiplusShutdown(gdipToken);
     return (int)m.wParam;
 }

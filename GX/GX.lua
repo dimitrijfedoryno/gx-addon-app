@@ -58,12 +58,20 @@ local function InitDB()
 	if type(GX_DB.minimap) ~= "table" then
 		GX_DB.minimap = {}
 	end
-	if GX_DB.minimap.shown == nil then
-		GX_DB.minimap.shown = true
+	-- LibDBIcon-1.0 reads/writes "hide" and "minimapPos" on this table directly.
+	-- Migrate the old hand-rolled schema (shown / degrees) into that shape once.
+	if GX_DB.minimap.hide == nil then
+		if GX_DB.minimap.shown ~= nil then
+			GX_DB.minimap.hide = (GX_DB.minimap.shown == false)
+		else
+			GX_DB.minimap.hide = false
+		end
 	end
-	if GX_DB.minimap.degrees == nil then
-		GX_DB.minimap.degrees = 220
+	if GX_DB.minimap.minimapPos == nil then
+		GX_DB.minimap.minimapPos = GX_DB.minimap.degrees or 220
 	end
+	GX_DB.minimap.shown = nil
+	GX_DB.minimap.degrees = nil
 	if GX_DB.autosaveNoInstances == nil then
 		GX_DB.autosaveNoInstances = true
 	end
@@ -92,18 +100,76 @@ local AUTOSAVE_DEFAULT_S = 60 * 60
 GXMainFrame = nil
 GXExportFrame = nil
 
+-- LibDataBroker data object backing the minimap/DataBar icon (assigned once
+-- LibDataBroker is confirmed available; see the minimap button section).
+local GXLDBObject = nil
+
 -- ===========================================================================
 -- Money helpers
 -- ===========================================================================
 
--- Character lookup key: "Name-Realm".
+-- Realms are inconsistent about spaces/apostrophes between API calls and
+-- client versions (e.g. "Drak'thul" vs "Drakthul"), and connected realms can
+-- report slightly different display names. Strip both so the same character
+-- always maps to the same key.
+local function NormalizeRealmName(realm)
+	if not realm or realm == "" then
+		return realm
+	end
+	realm = realm:gsub("'", "")
+	realm = realm:gsub("%s+", "")
+	return realm
+end
+
+-- Character lookup key: "Name-NormalizedRealm".
+-- GetNormalizedRealmName() already strips spaces (it's what unit tokens use
+-- for connected realms); NormalizeRealmName() additionally strips apostrophes.
 local function GetCharacterKey()
 	local name = UnitName("player")
-	local realm = GetRealmName()
+	local realm = (GetNormalizedRealmName and GetNormalizedRealmName()) or GetRealmName()
 	if not name or name == UNKNOWNOBJECT then
 		return nil
 	end
+	realm = NormalizeRealmName(realm)
+	if not realm or realm == "" then
+		return nil
+	end
 	return name .. "-" .. realm
+end
+
+local function SplitCharacterKey(key)
+	return key:match("^(.-)%-(.+)$")
+end
+
+local function NormalizeCharacterKey(key)
+	local name, realm = SplitCharacterKey(key)
+	if not name or not realm then
+		return key
+	end
+	return name .. "-" .. NormalizeRealmName(realm)
+end
+
+-- One-time migration: fold any old-format keys (raw GetRealmName(), with
+-- spaces/apostrophes) into the normalized key, keeping whichever entry was
+-- seen most recently instead of silently dropping data.
+local characterKeysMigrated = false
+local function MigrateCharacterKeys()
+	if characterKeysMigrated then
+		return
+	end
+	characterKeysMigrated = true
+	InitDB()
+	local merged = {}
+	for key, data in pairs(GX_DB.characters) do
+		local normalizedKey = NormalizeCharacterKey(key)
+		local existing = merged[normalizedKey]
+		if type(data) == "table" and (not existing or (tonumber(data.lastSeen) or 0) > (tonumber(existing.lastSeen) or 0)) then
+			merged[normalizedKey] = data
+		elseif not existing then
+			merged[normalizedKey] = data
+		end
+	end
+	GX_DB.characters = merged
 end
 
 -- Store (overwrite) the current character's gold with a timestamp.
@@ -139,6 +205,24 @@ local function UpdateWarbandBankGold()
 	end
 end
 
+-- Forward declaration: real body is defined further down, once GXMainFrame /
+-- GXExportFrame exist. Declared here (not "local function") so the closure
+-- below always calls whatever RefreshOpenFrames currently points to.
+local RefreshOpenFrames
+
+-- Refresh Warband bank gold and any open frame, then re-check shortly after.
+-- C_Bank.FetchDepositedMoney can lag a frame behind the event that reports a
+-- deposit/withdraw made directly in the bank UI, so a single immediate fetch
+-- can still show the pre-transaction amount.
+local function ScheduleWarbandBankUpdate()
+	UpdateWarbandBankGold()
+	RefreshOpenFrames()
+	C_Timer.After(0.2, function()
+		UpdateWarbandBankGold()
+		RefreshOpenFrames()
+	end)
+end
+
 -- Sum all stored character gold values and Warband bank across the account.
 local function GetTotalGold()
 	InitDB()
@@ -158,13 +242,8 @@ local function GetTotalGold()
 end
 
 -- Plain-text money ("12,345g 67s 89c") - used in the copyable export box.
--- Thousands separator is implemented locally so we don't depend on the
--- optional/undocumented BreakUpLargeNumbers runtime helper.
-local function FormatThousands(value)
-	local s = tostring(math.floor(value))
-	return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
-end
-
+-- Thousands separator uses the client's own BreakUpLargeNumbers (FrameXML),
+-- so it stays consistent with locale settings instead of a hand-rolled regex.
 local function FormatMoneyText(money)
 	local gold = math.floor(money / COPPER_PER_GOLD)
 	local silver = math.floor((money - gold * COPPER_PER_GOLD) / COPPER_PER_SILVER)
@@ -173,7 +252,7 @@ local function FormatMoneyText(money)
 	local text = ""
 	local separator = ""
 	if gold > 0 then
-		text = text .. FormatThousands(gold) .. "g"
+		text = text .. BreakUpLargeNumbers(gold) .. "g"
 		separator = " "
 	end
 	if silver > 0 then
@@ -186,15 +265,29 @@ local function FormatMoneyText(money)
 	return text
 end
 
+-- Short gold-only text ("12,345g") for the LibDataBroker feed - what Titan
+-- Panel / ElvUI DataBars / Details! etc. show next to the icon.
+local function FormatMoneyCompact(money)
+	local gold = math.floor(money / COPPER_PER_GOLD)
+	return BreakUpLargeNumbers(gold) .. "g"
+end
+
 -- Native-styled money string (coin texture markup / colorblind abbreviations),
 -- produced by Blizzard's GetMoneyString. Used in the /gx show frame.
+-- Some client versions can return an empty string for 0 copper even with
+-- ShowZeroAsGold set, so fall back to a plain "0g" rather than showing nothing.
 local function GetStyledMoneyString(money)
-	return GetMoneyString(
+	money = tonumber(money) or 0
+	local text = GetMoneyString(
 		money,
 		MoneyStringConstants.SeparateThousands,
 		MoneyStringConstants.CheckGoldThreshold,
 		MoneyStringConstants.ShowZeroAsGold
 	)
+	if not text or text == "" then
+		return "0g"
+	end
+	return text
 end
 
 -- ===========================================================================
@@ -308,14 +401,19 @@ local function ToggleExportFrame()
 	ShowExportFrame()
 end
 
--- If any exported frame is open, refresh its content (e.g. after PLAYER_MONEY).
-local function RefreshOpenFrames()
+-- If any exported frame (or the LDB feed) is open/registered, refresh its
+-- content. Assigned (not "local function") because it was forward-declared
+-- earlier so ScheduleWarbandBankUpdate can already call it.
+RefreshOpenFrames = function()
+	local total = GetTotalGold()
 	if GXMainFrame and GXMainFrame:IsShown() then
-		GXMainFrame.Amount:SetText(GetStyledMoneyString(GetTotalGold()))
+		GXMainFrame.Amount:SetText(GetStyledMoneyString(total))
 	end
 	if GXExportFrame and GXExportFrame:IsShown() then
-		local total = GetTotalGold()
 		GXExportFrame.EditBox:SetText(FormatMoneyText(total) .. " (" .. tostring(total) .. "c)")
+	end
+	if GXLDBObject then
+		GXLDBObject.text = FormatMoneyCompact(total)
 	end
 end
 
@@ -385,11 +483,15 @@ local function ArmAutosaveFromSaved()
 end
 
 -- ===========================================================================
--- Minimap button (Blizzard circular tracking style, orbits Minimap perimeter)
--- Derived from wow-ui-source Minimap / Tracking / AddonCompartment patterns.
+-- Minimap / DataBroker icon
+-- Exposes gold through a standard LibDataBroker-1.1 data object instead of
+-- hand-rolled minimap trig. LibDBIcon-1.0 turns that data object into the
+-- draggable minimap button; any other LDB display (Titan Panel, ElvUI
+-- DataBars, Details!, XIV Databar, ...) can show the same feed directly.
 -- ===========================================================================
 
-local GXMinimapButton = nil
+local LDB = LibStub and LibStub:GetLibrary("LibDataBroker-1.1", true)
+local LDBIcon = LibStub and LibStub:GetLibrary("LibDBIcon-1.0", true)
 
 -- Forward declarations for the options panel
 local GXSettingsCategory = nil
@@ -397,156 +499,19 @@ local GXSettingsPanel = nil
 local OpenSettingsPanel
 local RegisterGXSettings
 
--- Standard shape definition for round, square and corner minimaps
-local MINIMAP_SHAPES = {
-	["ROUND"]                 = { true, true, true, true },
-	["SQUARE"]                = { false, false, false, false },
-	["CORNER-TOPLEFT"]        = { false, false, false, true },
-	["CORNER-TOPRIGHT"]       = { false, false, true, false },
-	["CORNER-BOTTOMLEFT"]     = { false, true, false, false },
-	["CORNER-BOTTOMRIGHT"]    = { true, false, false, false },
-	["SIDE-LEFT"]             = { false, true, false, true },
-	["SIDE-RIGHT"]            = { true, false, true, false },
-	["SIDE-TOP"]              = { false, false, true, true },
-	["SIDE-BOTTOM"]           = { true, true, false, false },
-	["TRICORNER-TOPLEFT"]     = { false, true, true, true },
-	["TRICORNER-TOPRIGHT"]    = { true, false, true, true },
-	["TRICORNER-BOTTOMLEFT"]  = { true, true, false, true },
-	["TRICORNER-BOTTOMRIGHT"] = { true, true, true, false },
-}
-
-local function GetMinimapButtonPosition(degrees, radius)
-	degrees = degrees or 220
-	radius = radius or 8
-	local angle = math.rad(degrees)
-	local cos = math.cos(angle)
-	local sin = math.sin(angle)
-
-	local q = 1
-	if cos < 0 then
-		q = q + 1
+-- Shared by the LDB tooltip and the Addon Compartment tooltip below.
+local function AddGXTooltipLines(tooltip)
+	tooltip:AddLine("GX - Total Account Gold")
+	tooltip:AddLine(GetStyledMoneyString(GetTotalGold()), 1, 1, 1)
+	if GX_DB.warband and GX_DB.warband.gold and GX_DB.warband.gold > 0 then
+		tooltip:AddLine("Warband Bank: " .. GetStyledMoneyString(GX_DB.warband.gold), 0.8, 0.8, 0.8)
 	end
-	if sin > 0 then
-		q = q + 2
-	end
-
-	local width = ((Minimap and Minimap:GetWidth() or 200) / 2) + radius
-	local height = ((Minimap and Minimap:GetHeight() or 200) / 2) + radius
-
-	local minimapShape = GetMinimapShape and GetMinimapShape() or "ROUND"
-	local shapes = MINIMAP_SHAPES[minimapShape] or MINIMAP_SHAPES["ROUND"]
-	local x, y
-
-	if shapes[q] then
-		x = cos * width
-		y = sin * height
-	else
-		x = math.max(-width, math.min(cos * (math.sqrt(2 * width ^ 2) - 10), width))
-		y = math.max(-height, math.min(sin * (math.sqrt(2 * height ^ 2) - 10), height))
-	end
-
-	return "CENTER", x, y
+	tooltip:AddLine(" ")
+	tooltip:AddLine("Left-click: toggle gold window | Right-click: options", 0.6, 0.8, 1)
 end
 
-local function ApplyMinimapButtonPosition(button)
-	InitDB()
-	local degrees = GX_DB.minimap.degrees or 220
-	local point, x, y = GetMinimapButtonPosition(degrees, 8)
-	button:ClearAllPoints()
-	button:SetPoint(point, Minimap, point, x, y)
-end
-
-local function OnMinimapButtonDragUpdate(self)
-	local scale = Minimap:GetEffectiveScale()
-	local minimapX, minimapY = Minimap:GetCenter()
-	local cursorX, cursorY = GetCursorPosition()
-
-	cursorX = cursorX / scale
-	cursorY = cursorY / scale
-
-	local degrees = math.deg(math.atan2(cursorY - minimapY, cursorX - minimapX)) % 360
-	GX_DB.minimap.degrees = degrees
-	ApplyMinimapButtonPosition(self)
-end
-
-local function CreateMinimapButton()
-	local button = CreateFrame("Button", "GXMinimapButton", Minimap, "GXMinimapButtonTemplate")
-	button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-	button:RegisterForDrag("LeftButton")
-
-	-- Circle mask on the icon matching Blizzard character/portrait style
-	if button.Icon then
-		local mask = button:CreateMaskTexture()
-		mask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
-		mask:SetAllPoints(button.Icon)
-		button.Icon:AddMaskTexture(mask)
-	end
-
-	button:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-		GameTooltip:AddLine("GX - Total Account Gold")
-		GameTooltip:AddLine(GetStyledMoneyString(GetTotalGold()), 1, 1, 1)
-		if GX_DB.warband and GX_DB.warband.gold and GX_DB.warband.gold > 0 then
-			GameTooltip:AddLine("Warband Bank: " .. GetStyledMoneyString(GX_DB.warband.gold), 0.8, 0.8, 0.8)
-		end
-		GameTooltip:AddLine(" ")
-		GameTooltip:AddLine("Left-click: toggle gold window | Right-click: options", 0.6, 0.8, 1)
-		GameTooltip:AddLine("Drag to move around minimap", 0.4, 0.4, 0.4)
-		GameTooltip:Show()
-	end)
-
-	button:SetScript("OnLeave", function(self)
-		GameTooltip:Hide()
-	end)
-
-	button:SetScript("OnMouseDown", function(self, mouseButton)
-		if self.Icon and self.Icon.AdjustPointsOffset then
-			self.Icon:AdjustPointsOffset(1, -1)
-		end
-	end)
-
-	button:SetScript("OnMouseUp", function(self, mouseButton)
-		if self.Icon and self.Icon.AdjustPointsOffset then
-			self.Icon:AdjustPointsOffset(-1, 1)
-		end
-	end)
-
-	button:SetScript("OnDragStart", function(self)
-		self.wasDragged = true
-		self:LockHighlight()
-		self:SetScript("OnUpdate", OnMinimapButtonDragUpdate)
-	end)
-
-	button:SetScript("OnDragStop", function(self)
-		self:UnlockHighlight()
-		self:SetScript("OnUpdate", nil)
-		C_Timer.After(0.05, function()
-			self.wasDragged = false
-		end)
-	end)
-
-	button:SetScript("OnClick", function(self, mouseButton)
-		if self.wasDragged then
-			return
-		end
-		if mouseButton == "RightButton" then
-			OpenSettingsPanel()
-		else
-			SaveCurrentCharacterGold()
-			ToggleTotalGoldFrame()
-		end
-	end)
-
-	ApplyMinimapButtonPosition(button)
-	button:SetShown(not GX_DB or not GX_DB.minimap or GX_DB.minimap.shown ~= false)
-	return button
-end
-
--- ===========================================================================
--- Addon Compartment (Blizzard native minimap menu in Dragonflight / TWW)
--- ===========================================================================
-
-function GX_OnAddonCompartmentClick(addonName, mouseButton)
+-- Shared by the LDB OnClick and the Addon Compartment click handler below.
+local function OnGXDataObjectClick(_, mouseButton)
 	if mouseButton == "RightButton" then
 		OpenSettingsPanel()
 	else
@@ -555,15 +520,39 @@ function GX_OnAddonCompartmentClick(addonName, mouseButton)
 	end
 end
 
+local function CreateMinimapButton()
+	if not LDB then
+		print(addonLabel() .. "LibDataBroker-1.1 not available - minimap icon disabled.")
+		return
+	end
+	GXLDBObject = LDB:NewDataObject("GX", {
+		type = "data source",
+		text = FormatMoneyCompact(GetTotalGold()),
+		icon = COIN_ICON,
+		OnClick = OnGXDataObjectClick,
+		OnTooltipShow = function(tooltip)
+			AddGXTooltipLines(tooltip)
+			tooltip:AddLine("Drag to move around minimap", 0.4, 0.4, 0.4)
+		end,
+	})
+	if LDBIcon then
+		LDBIcon:Register("GX", GXLDBObject, GX_DB.minimap)
+	else
+		print(addonLabel() .. "LibDBIcon-1.0 not available - minimap icon disabled.")
+	end
+end
+
+-- ===========================================================================
+-- Addon Compartment (Blizzard native minimap menu in Dragonflight / TWW)
+-- ===========================================================================
+
+function GX_OnAddonCompartmentClick(addonName, mouseButton)
+	OnGXDataObjectClick(nil, mouseButton)
+end
+
 function GX_OnAddonCompartmentEnter(addonName, button)
 	GameTooltip:SetOwner(button, "ANCHOR_LEFT")
-	GameTooltip:AddLine("GX - Total Account Gold")
-	GameTooltip:AddLine(GetStyledMoneyString(GetTotalGold()), 1, 1, 1)
-	if GX_DB.warband and GX_DB.warband.gold and GX_DB.warband.gold > 0 then
-		GameTooltip:AddLine("Warband Bank: " .. GetStyledMoneyString(GX_DB.warband.gold), 0.8, 0.8, 0.8)
-	end
-	GameTooltip:AddLine(" ")
-	GameTooltip:AddLine("Left-click: toggle gold window | Right-click: options", 0.6, 0.8, 1)
+	AddGXTooltipLines(GameTooltip)
 	GameTooltip:Show()
 end
 
@@ -632,7 +621,7 @@ OpenSettingsPanel = function()
 end
 
 local function BuildSettingsPanel(panel)
-	panel:SetSize(460, 340)
+	panel:SetSize(460, 380)
 
 	local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("TOPLEFT", 20, -20)
@@ -653,9 +642,13 @@ local function BuildSettingsPanel(panel)
 	minimapCheck:SetPoint("TOPLEFT", 20, -108)
 	minimapCheck:SetScript("OnClick", function(self)
 		InitDB()
-		GX_DB.minimap.shown = self:GetChecked() == true
-		if GXMinimapButton then
-			GXMinimapButton:SetShown(GX_DB.minimap.shown)
+		GX_DB.minimap.hide = self:GetChecked() ~= true
+		if LDBIcon then
+			if GX_DB.minimap.hide then
+				LDBIcon:Hide("GX")
+			else
+				LDBIcon:Show("GX")
+			end
 		end
 	end)
 	panel.MinimapCheck = minimapCheck
@@ -736,16 +729,19 @@ local function BuildSettingsPanel(panel)
 	resetButton:SetText("Reset saved gold")
 	resetButton:SetPoint("LEFT", reloadButton, "RIGHT", 10, 0)
 	resetButton:SetScript("OnClick", function()
-		GX_DB.characters = {}
-		GX_DB.warband = { gold = 0, lastSeen = time() }
-		print(addonLabel() .. "All saved gold data cleared.")
+		StaticPopup_Show("GX_CONFIRM_RESET")
 	end)
+
+	local resetHint = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	resetHint:SetPoint("BOTTOMLEFT", showButton, "TOPLEFT", 0, 10)
+	resetHint:SetJustifyH("LEFT")
+	resetHint:SetText("To drop a single stale character (deleted/renamed/moved) instead of\nwiping everything, use |cffffffff/gx characters|r and |cffffffff/gx forget <name-realm>|r.")
 
 	-- Sync the controls with GX_DB whenever the settings panel is shown.
 	panel.OnRefresh = function(self)
 		InitDB()
 		self.TotalLabel:SetText("Current total: " .. GetStyledMoneyString(GetTotalGold()))
-		self.MinimapCheck:SetChecked(not GX_DB.minimap or GX_DB.minimap.shown ~= false)
+		self.MinimapCheck:SetChecked(not GX_DB.minimap or GX_DB.minimap.hide ~= true)
 		self.NoInstancesCheck:SetChecked(GX_DB.autosaveNoInstances ~= false)
 		local minutes = math.max(math.floor((GX_DB.autosaveMinutes or 0) + 0.5), 0)
 		self.AutoSlider:SetValue(minutes)
@@ -784,6 +780,90 @@ do
 end
 
 -- ===========================================================================
+-- Character list management (/gx characters, /gx forget)
+-- Lets a single stale entry (deleted/renamed/moved character) be dropped
+-- without wiping the whole database via /gx reset.
+-- ===========================================================================
+
+local function GetSortedCharacterEntries()
+	InitDB()
+	local entries = {}
+	for key, data in pairs(GX_DB.characters) do
+		if type(data) == "table" then
+			table.insert(entries, { key = key, data = data })
+		end
+	end
+	table.sort(entries, function(a, b)
+		return (tonumber(a.data.lastSeen) or 0) > (tonumber(b.data.lastSeen) or 0)
+	end)
+	return entries
+end
+
+local function PrintCharacterList()
+	local entries = GetSortedCharacterEntries()
+	if #entries == 0 then
+		print(addonLabel() .. "No saved characters yet.")
+		return
+	end
+	print(addonLabel() .. "Saved characters (" .. #entries .. "):")
+	for i, entry in ipairs(entries) do
+		local lastSeen = tonumber(entry.data.lastSeen)
+		local when = lastSeen and date("%Y-%m-%d", lastSeen) or "?"
+		print(string.format("%s|cffffffff%d.|r %s - %s (last seen %s)",
+			addonLabel(), i, entry.key, GetStyledMoneyString(tonumber(entry.data.gold) or 0), when))
+	end
+	print(addonLabel() .. "Use |cffffffff/gx forget <number or Name-Realm>|r to drop one.")
+end
+
+local function ForgetCharacter(identifier)
+	identifier = (identifier or ""):match("^%s*(.-)%s*$")
+	if identifier == "" then
+		print(addonLabel() .. "Usage: /gx forget <number from /gx characters, or Name-Realm>.")
+		return
+	end
+	local entries = GetSortedCharacterEntries()
+	local index = tonumber(identifier)
+	local targetKey = nil
+	if index and entries[math.floor(index)] then
+		targetKey = entries[math.floor(index)].key
+	else
+		for _, entry in ipairs(entries) do
+			if entry.key:lower() == identifier:lower() then
+				targetKey = entry.key
+				break
+			end
+		end
+	end
+	if not targetKey then
+		print(addonLabel() .. "No saved character matches '" .. identifier .. "'. Use /gx characters to list them.")
+		return
+	end
+	GX_DB.characters[targetKey] = nil
+	print(addonLabel() .. "Forgot " .. targetKey .. ". New total: " .. GetStyledMoneyString(GetTotalGold()))
+	RefreshOpenFrames()
+end
+
+-- ===========================================================================
+-- Confirmation dialogs
+-- ===========================================================================
+
+StaticPopupDialogs["GX_CONFIRM_RESET"] = {
+	text = "Delete ALL saved GX gold data - every character and the Warband bank? This cannot be undone.\n\nTip: to drop just one stale character instead, use /gx forget.",
+	button1 = "Delete all",
+	button2 = "Cancel",
+	OnAccept = function()
+		GX_DB.characters = {}
+		GX_DB.warband = { gold = 0, lastSeen = time() }
+		print(addonLabel() .. "All saved gold data cleared.")
+		RefreshOpenFrames()
+	end,
+	timeout = 0,
+	whileDead = true,
+	hideOnEscape = true,
+	preferredIndex = 3,
+}
+
+-- ===========================================================================
 -- Slash command: /gx
 -- ===========================================================================
 
@@ -801,8 +881,10 @@ SlashCmdList.GX = function(msg)
 		print(addonLabel() .. "  |cffffffff/gx autosave <min>|r  - set interval (>= 1)")
 		print(addonLabel() .. "  |cffffffff/gx autosave off|r    - stop autosave")
 		print(addonLabel() .. "  |cffffffff/gx settings|r    - open the options panel (Esc -> Options -> AddOns)")
-		print(addonLabel() .. "  |cffffffff/gx minimap|r     - show / hide the circular minimap icon")
-		print(addonLabel() .. "  |cffffffff/gx reset|r       - clear all saved gold data")
+		print(addonLabel() .. "  |cffffffff/gx minimap|r     - show / hide the minimap icon")
+		print(addonLabel() .. "  |cffffffff/gx characters|r  - list every saved character + last seen date")
+		print(addonLabel() .. "  |cffffffff/gx forget <# or Name-Realm>|r - drop one stale character's saved gold")
+		print(addonLabel() .. "  |cffffffff/gx reset|r       - clear ALL saved gold data (asks to confirm)")
 	elseif cmd == "show" then
 		SaveCurrentCharacterGold()
 		ToggleTotalGoldFrame()
@@ -830,15 +912,21 @@ SlashCmdList.GX = function(msg)
 		OpenSettingsPanel()
 	elseif cmd == "minimap" then
 		InitDB()
-		GX_DB.minimap.shown = not (GX_DB.minimap.shown ~= false)
-		if GXMinimapButton then
-			GXMinimapButton:SetShown(GX_DB.minimap.shown)
+		GX_DB.minimap.hide = not (GX_DB.minimap.hide == true)
+		if LDBIcon then
+			if GX_DB.minimap.hide then
+				LDBIcon:Hide("GX")
+			else
+				LDBIcon:Show("GX")
+			end
 		end
-		print(addonLabel() .. (GX_DB.minimap.shown and "Minimap icon shown." or "Minimap icon hidden."))
+		print(addonLabel() .. (GX_DB.minimap.hide and "Minimap icon hidden." or "Minimap icon shown."))
+	elseif cmd == "characters" then
+		PrintCharacterList()
+	elseif cmd == "forget" then
+		ForgetCharacter(rest)
 	elseif cmd == "reset" then
-		GX_DB.characters = {}
-		GX_DB.warband = { gold = 0, lastSeen = time() }
-		print(addonLabel() .. "All saved gold data cleared.")
+		StaticPopup_Show("GX_CONFIRM_RESET")
 	else
 		print(addonLabel() .. "Unknown command '" .. cmd .. "'. Type /gx for help.")
 	end
@@ -848,12 +936,29 @@ end
 -- Event handling
 -- ===========================================================================
 
+-- PLAYER_MONEY fires repeatedly during mass looting/vendor sales. Debounce it
+-- (trailing edge) so a burst of events collapses into one save + refresh.
+local MONEY_UPDATE_DEBOUNCE_S = 0.5
+local moneyUpdateTimer = nil
+
+local function DebouncedPlayerMoneyUpdate()
+	if moneyUpdateTimer then
+		moneyUpdateTimer:Cancel()
+	end
+	moneyUpdateTimer = C_Timer.NewTimer(MONEY_UPDATE_DEBOUNCE_S, function()
+		moneyUpdateTimer = nil
+		SaveCurrentCharacterGold()
+		RefreshOpenFrames()
+	end)
+end
+
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("PLAYER_MONEY")
 eventFrame:RegisterEvent("ACCOUNT_MONEY")
 eventFrame:RegisterEvent("BANKFRAME_OPENED")
+eventFrame:RegisterEvent("BANKFRAME_CLOSED")
 eventFrame:SetScript("OnEvent", function(self, event, ...)
 	if event == "ADDON_LOADED" then
 		local addon = ...
@@ -862,23 +967,20 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 		end
 	elseif event == "PLAYER_LOGIN" then
 		InitDB()
+		MigrateCharacterKeys()
 		-- Fresh login: save the live value right away and re-arm autosave.
 		SaveCurrentCharacterGold()
-		UpdateWarbandBankGold()
+		ScheduleWarbandBankUpdate()
 		ArmAutosaveFromSaved()
 		RegisterAddonCompartment()
-		-- Create the draggable minimap icon once the UI is fully up.
-		if not GXMinimapButton then
-			GXMinimapButton = CreateMinimapButton()
-		end
+		-- Create the minimap/DataBroker icon once the UI is fully up.
+		CreateMinimapButton()
 	elseif event == "PLAYER_MONEY" then
-		-- Money changed: update stored value + any open frame.
-		SaveCurrentCharacterGold()
-		UpdateWarbandBankGold()
-		RefreshOpenFrames()
-	elseif event == "ACCOUNT_MONEY" or event == "BANKFRAME_OPENED" then
-		UpdateWarbandBankGold()
-		RefreshOpenFrames()
+		DebouncedPlayerMoneyUpdate()
+	elseif event == "ACCOUNT_MONEY" or event == "BANKFRAME_OPENED" or event == "BANKFRAME_CLOSED" then
+		-- Deposits/withdrawals made directly in the bank UI: refresh immediately
+		-- and once more shortly after (see ScheduleWarbandBankUpdate).
+		ScheduleWarbandBankUpdate()
 	end
 end)
 
@@ -892,11 +994,20 @@ do
 	if not GetMoneyString then
 		tinsert(missing, "GetMoneyString")
 	end
+	if not BreakUpLargeNumbers then
+		tinsert(missing, "BreakUpLargeNumbers")
+	end
 	if not UISpecialFrames then
 		tinsert(missing, "UISpecialFrames")
 	end
 	if not EventUtil then
 		tinsert(missing, "EventUtil")
+	end
+	if not StaticPopupDialogs then
+		tinsert(missing, "StaticPopupDialogs")
+	end
+	if not LibStub then
+		tinsert(missing, "LibStub")
 	end
 	if next(missing) then
 		print(addonLabel() .. "WARNING: missing FrameXML helpers - " .. table.concat(missing, ", "))

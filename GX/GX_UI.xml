@@ -68,37 +68,4 @@
         </Frames>
     </Frame>
 
-    <!-- Minimap button: circular coin icon orbiting Minimap -->
-    <Button name="GXMinimapButtonTemplate" virtual="true"
-            frameStrata="MEDIUM" frameLevel="8" hidden="true">
-        <Size x="32" y="32"/>
-        <Layers>
-            <Layer level="BACKGROUND">
-                <Texture parentKey="Background" file="Interface\Minimap\UI-Minimap-Background">
-                    <Size x="25" y="25"/>
-                    <Anchors>
-                        <Anchor point="TOPLEFT" x="2" y="-4"/>
-                    </Anchors>
-                </Texture>
-            </Layer>
-            <Layer level="ARTWORK">
-                <Texture parentKey="Icon" file="Interface\Icons\INV_Misc_Coin_05">
-                    <Size x="18" y="18"/>
-                    <Anchors>
-                        <Anchor point="CENTER" x="0" y="0"/>
-                    </Anchors>
-                </Texture>
-            </Layer>
-            <Layer level="OVERLAY">
-                <Texture parentKey="Border" file="Interface\Minimap\MiniMap-TrackingBorder">
-                    <Size x="54" y="54"/>
-                    <Anchors>
-                        <Anchor point="TOPLEFT" x="0" y="0"/>
-                    </Anchors>
-                </Texture>
-            </Layer>
-        </Layers>
-        <HighlightTexture file="Interface\Minimap\UI-Minimap-ZoomButton-Highlight" alphaMode="ADD"/>
-    </Button>
-
 </Ui>

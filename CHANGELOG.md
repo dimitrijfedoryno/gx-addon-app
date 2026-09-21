@@ -7,6 +7,44 @@ Tento soubor sleduje dvě samostatně verzované části repozitáře: WoW addon
 
 # GX Monitor (Windows aplikace)
 
+## 1.0.1
+
+### Novinky
+
+- **Levý ikonový sidebar** nahradil tlačítko „Settings" v dolní řadě —
+  ikona domečku (dashboard) a ozubeného kolečka (nastavení), aktivní
+  položka má plnou zlatou „tab" plochu (zaoblenou jen vpravo, bílá ikona),
+  neaktivní jen tichou ikonu. Dolní řada teď má jen Pause/Refresh/Open
+  output.
+- Obrazovka Nastavení dostala vlastní nadpis „Settings"; tlačítko „‹ Back"
+  zmizelo, návrat na dashboard řeší ikona domečku v sidebaru.
+
+### Opravy
+
+- **Aktivní zlatý rámeček okna mizel po přepnutí na Nastavení.** `SetFocus`
+  na první textové pole poslal hlavnímu oknu `WM_KILLFOCUS`, což se mylně
+  vyhodnotilo jako ztráta fokusu celé aplikace. Teď se kontroluje, jestli
+  fokus zůstává na vlastním child controlu (`IsChild`), a rámeček zhasíná
+  jen při skutečném přepnutí na jinou aplikaci.
+- **Blikání obsahu i ikon v Nastavení.** Chyběl styl `WS_CLIPCHILDREN`
+  (pozadí kreslené na hlavní okno přemazávalo už vykreslené child controly)
+  a `PaintSettingsBg` na rozdíl od dashboardu nekreslila do paměťového DC
+  (žádné dvojité bufferování) — obojí opraveno.
+- **Updater se mohl zacyklit navždy na pozadí**, pokud se nepodařilo
+  nahradit běžící `.exe` (např. složka bez práv k zápisu) — omezeno na
+  30 pokusů, pak se důvod zapíše do `%TEMP%\gx_update_failed.txt`.
+- **Selhání aktualizace bylo skoro neviditelné** — hláška zmizela hned po
+  neúspěchu. Teď zůstává červeně ve stavovém řádku a tlačítko se přepne na
+  „Retry", dokud uživatel akci nezopakuje.
+- Přidán `gx_update.log` vedle `.exe` se záznamem každého pokusu o
+  kontrolu/stažení/instalaci (HTTP stavové kódy, Win32 chybové kódy, URL) —
+  usnadňuje zjistit, proč aktualizace na cizím počítači neproběhla.
+- Interní číslo verze appky (`GX_APP_VERSION`) bylo natvrdo `1.0.0`
+  nezávisle na tagu GitHub Release, takže updater po nainstalování
+  „novější" verze pořád hlásil, že je dostupná aktualizace (appka sama
+  sebe pořád viděla jako 1.0.0). Opraveno — verze v kódu se teď musí
+  shodovat s tagem každého vydání.
+
 ## 1.0.0
 
 ### Novinky

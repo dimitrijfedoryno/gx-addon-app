@@ -90,10 +90,17 @@ static RECT g_capMinR{}, g_capCloseR{};
 static int g_hoverCap = -1;
 static int g_capDown = -1;
 
+// Left icon nav rail (Home / Settings), full height below the caption.
+static int g_sidebarW = 52;
+static RECT g_navHomeR{}, g_navGearR{};
+static int g_hoverNav = -1;
+static int g_navDown = -1;
+
 // In-app updater. The badge sits just under the caption row, right-aligned.
 static std::mutex g_updateMu;
 static bool g_updateAvailable = false;
 static bool g_updating = false;
+static bool g_updateFailed = false;
 static UpdateInfo g_updateInfo;
 static std::wstring g_updateStatus;
 static RECT g_updateBadgeR{};
@@ -117,12 +124,15 @@ static HFONT g_fntUi = NULL;
 enum View { VIEW_DASHBOARD = 0, VIEW_SETTINGS = 1 };
 static View g_view = VIEW_DASHBOARD;
 
+// Dashboard bottom-row button actions. Settings now lives in the sidebar.
+enum { ACT_NONE = -1, ACT_PAUSE = 0, ACT_OPEN = 1, ACT_REFRESH = 2 };
+
 // Settings view child controls
 enum {
     IDC_ED_FILE   = 2001, IDC_ED_ACCT = 2002, IDC_ED_OUT = 2003, IDC_ED_POLL = 2004,
     IDC_CHK_RAW   = 2005, IDC_CHK_MIN = 2006, IDC_CHK_RUN = 2007,
     IDC_BTN_BROWSE_GX = 2008, IDC_BTN_BROWSE_OUT = 2009, IDC_BTN_DETECT = 2010,
-    IDC_BTN_SAVE  = 2011, IDC_BTN_BACK = 2012,
+    IDC_BTN_SAVE  = 2011,
     IDC_LBL_FILE  = 2013, IDC_LBL_ACCT = 2014, IDC_LBL_OUT = 2015, IDC_LBL_POLL = 2016,
     IDC_ED_OUTPATH = 2017, IDC_BTN_COPY = 2018
 };
@@ -202,6 +212,16 @@ static void ComputeCaptionRects(HWND hwnd) {
     int upW = (int)(84 * s), upH = (int)(24 * s);
     int upTop = g_capH + (int)(8 * s);
     g_updateBadgeR = { full.right - (int)(12 * s) - upW, upTop, full.right - (int)(12 * s), upTop + upH };
+
+    // Left icon nav rail: Home (dashboard) and Settings (gear), stacked near
+    // the top, full-height sidebar drawn separately in DrawSidebar.
+    g_sidebarW = (int)(52 * s);
+    int navSz = (int)(40 * s);
+    int navGap = (int)(6 * s);
+    int navX = (g_sidebarW - navSz) / 2;
+    int navY0 = g_capH + (int)(10 * s);
+    g_navHomeR = { navX, navY0, navX + navSz, navY0 + navSz };
+    g_navGearR = { navX, navY0 + navSz + navGap, navX + navSz, navY0 + 2 * navSz + navGap };
 }
 
 static int CapHitTest(int x, int y) {
@@ -215,6 +235,13 @@ static bool UpdateBadgeHit(int x, int y) {
     if (!g_updateAvailable || g_updating) return false;
     POINT p{ x, y };
     return PtInRect(&g_updateBadgeR, p) != FALSE;
+}
+
+static int NavHitTest(int x, int y) {
+    POINT p{ x, y };
+    if (PtInRect(&g_navHomeR, p)) return 0;
+    if (PtInRect(&g_navGearR, p)) return 1;
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +298,7 @@ struct Layout {
     RECT cardA, cardALbl, cardAVal, cardATiny;
     RECT cardB, cardBLbl, cardBVal, cardBTiny;
     RECT statusL, statusR;
-    RECT btnSet, btnPause, btnRefresh, btnOpen;
+    RECT btnPause, btnRefresh, btnOpen;
 };
 static Layout g_layout;
 
@@ -283,9 +310,10 @@ static void ComputeLayout(HWND hwnd) {
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
     int capH = g_capH;
+    int left = g_sidebarW + pad; // content starts right of the icon nav rail
 
     Layout L;
-    L.bigCard = { pad, capH + (int)(12 * s), W - pad, capH + (int)(128 * s) };
+    L.bigCard = { left, capH + (int)(12 * s), W - pad, capH + (int)(128 * s) };
     L.bigCap  = { L.bigCard.left + (int)(20 * s), L.bigCard.top + (int)(12 * s),
                   L.bigCard.right - (int)(20 * s), L.bigCard.top + (int)(30 * s) };
     L.bigVal  = { L.bigCap.left, L.bigCard.top + (int)(28 * s),
@@ -294,10 +322,10 @@ static void ComputeLayout(HWND hwnd) {
                   L.bigCap.right, L.bigCard.bottom - (int)(12 * s) };
 
     int gap = (int)(12 * s);
-    int cw  = (W - 2 * pad - gap) / 2;
+    int cw  = (W - left - pad - gap) / 2;
     int cy  = L.bigCard.bottom + (int)(12 * s);
-    L.cardA = { pad, cy, pad + cw, cy + (int)(76 * s) };
-    L.cardB = { pad + cw + gap, cy, pad + cw + gap + cw, cy + (int)(76 * s) };
+    L.cardA = { left, cy, left + cw, cy + (int)(76 * s) };
+    L.cardB = { left + cw + gap, cy, left + cw + gap + cw, cy + (int)(76 * s) };
     L.cardALbl  = { L.cardA.left + (int)(16 * s), L.cardA.top + (int)(10 * s),
                     L.cardA.right - (int)(12 * s), L.cardA.top + (int)(26 * s) };
     L.cardAVal  = { L.cardALbl.left, L.cardA.top + (int)(24 * s),
@@ -312,16 +340,16 @@ static void ComputeLayout(HWND hwnd) {
                     L.cardB.right - (int)(12 * s), L.cardB.bottom - (int)(6 * s) };
 
     int sy = L.cardB.bottom + (int)(12 * s);
-    L.statusL = { pad, sy + (int)(4 * s), W / 2, sy + (int)(24 * s) };
-    L.statusR = { W / 2, L.statusL.top, W - pad, L.statusL.bottom };
+    int mid = (left + W - pad) / 2;
+    L.statusL = { left, sy + (int)(4 * s), mid, sy + (int)(24 * s) };
+    L.statusR = { mid, L.statusL.top, W - pad, L.statusL.bottom };
 
     int by = H - (int)(12 * s) - (int)(30 * s);
     int bgap = (int)(8 * s);
-    int bw = (W - 2 * pad - 3 * bgap) / 4;
-    L.btnSet     = { pad, by, pad + bw, by + (int)(30 * s) };
-    L.btnPause   = { pad + bw + bgap, by, pad + 2 * bw + bgap, by + (int)(30 * s) };
-    L.btnRefresh = { pad + 2 * bw + 2 * bgap, by, pad + 3 * bw + 2 * bgap, by + (int)(30 * s) };
-    L.btnOpen    = { pad + 3 * bw + 3 * bgap, by, pad + 4 * bw + 3 * bgap, by + (int)(30 * s) };
+    int bw = (W - left - pad - 2 * bgap) / 3;
+    L.btnPause   = { left, by, left + bw, by + (int)(30 * s) };
+    L.btnRefresh = { left + bw + bgap, by, left + 2 * bw + bgap, by + (int)(30 * s) };
+    L.btnOpen    = { left + 2 * bw + 2 * bgap, by, left + 3 * bw + 2 * bgap, by + (int)(30 * s) };
     g_layout = L;
 }
 
@@ -511,9 +539,112 @@ static void DrawUpdateBadge(HDC dc) {
     SetTextColor(dc, RGB(0x1A, 0x1D, 0x24));
     HGDIOBJ of = SelectObject(dc, g_fBtn);
     RECT tr = g_updateBadgeR;
-    DrawTextW(dc, g_updating ? L"Updating\x2026" : L"Update", -1, &tr,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    const wchar_t* label = g_updating ? L"Updating\x2026" : g_updateFailed ? L"Retry" : L"Update";
+    DrawTextW(dc, label, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, of);
+}
+
+static void DrawHomeIcon(Gdiplus::Graphics& g, float cx, float cy, float sz, Gdiplus::Color col) {
+    Gdiplus::Pen pen(col, sz * 0.16f);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    Gdiplus::PointF roof[3] = {
+        Gdiplus::PointF(cx - sz, cy + sz * 0.05f),
+        Gdiplus::PointF(cx, cy - sz),
+        Gdiplus::PointF(cx + sz, cy + sz * 0.05f)
+    };
+    g.DrawLines(&pen, roof, 3);
+    float bx = sz * 0.68f, bt = cy - sz * 0.05f, bb = cy + sz * 0.85f;
+    g.DrawLine(&pen, cx - bx, bt, cx - bx, bb);
+    g.DrawLine(&pen, cx + bx, bt, cx + bx, bb);
+    g.DrawLine(&pen, cx - bx, bb, cx + bx, bb);
+    Gdiplus::SolidBrush doorBrush(col);
+    float dw = sz * 0.36f, dh = sz * 0.52f;
+    g.FillRectangle(&doorBrush, cx - dw / 2, bb - dh, dw, dh);
+}
+
+static void DrawGearIcon(Gdiplus::Graphics& g, float cx, float cy, float sz,
+                         Gdiplus::Color col, Gdiplus::Color holeCol) {
+    Gdiplus::SolidBrush brush(col);
+    const int teeth = 8;
+    float outerR = sz, bodyR = sz * 0.62f, toothW = sz * 0.36f, toothLen = sz * 0.36f;
+    Gdiplus::Matrix identity;
+    for (int i = 0; i < teeth; i++) {
+        Gdiplus::Matrix m;
+        m.RotateAt(360.0f * i / teeth, Gdiplus::PointF(cx, cy));
+        g.SetTransform(&m);
+        g.FillRectangle(&brush, cx - toothW / 2, cy - outerR, toothW, toothLen);
+        g.SetTransform(&identity);
+    }
+    g.FillEllipse(&brush, cx - bodyR, cy - bodyR, bodyR * 2, bodyR * 2);
+    Gdiplus::SolidBrush hole(holeCol);
+    float holeR = sz * 0.3f;
+    g.FillEllipse(&hole, cx - holeR, cy - holeR, holeR * 2, holeR * 2);
+}
+
+// A rectangle rounded only on its right side -- used for the active nav
+// tab, which sits flush against the sidebar's own left edge and blends into
+// the content area on the right.
+static void FillRightRoundedRect(Gdiplus::Graphics& g, Gdiplus::Brush& brush,
+                                 float x, float y, float w, float h, float r) {
+    Gdiplus::GraphicsPath path;
+    path.AddLine(x, y, x + w - r, y);
+    path.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
+    path.AddLine(x + w, y + r, x + w, y + h - r);
+    path.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90);
+    path.AddLine(x + w - r, y + h, x, y + h);
+    path.CloseFigure();
+    g.FillPath(&brush, &path);
+}
+
+static void DrawNavIcon(HDC dc, const RECT& rc, int kind, bool active, bool hover) {
+    COLORREF bgCol = active ? C_GOLD : (hover ? C_CAPHOV : C_BG);
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+    if (active) {
+        Gdiplus::SolidBrush brush(Gdiplus::Color(255,
+            GetRValue(C_GOLD), GetGValue(C_GOLD), GetBValue(C_GOLD)));
+        float r = (float)(rc.right - rc.left) * 0.28f;
+        FillRightRoundedRect(g, brush, 0.0f, (float)rc.top,
+                             (float)g_sidebarW, (float)(rc.bottom - rc.top), r);
+    } else if (hover) {
+        int r = (int)((rc.right - rc.left) * 0.28);
+        HRGN rg = CreateRoundRectRgn(rc.left, rc.top, rc.right, rc.bottom, r, r);
+        HBRUSH b = CreateSolidBrush(bgCol);
+        FillRgn(dc, rg, b);
+        DeleteObject(b);
+        DeleteObject(rg);
+    }
+
+    COLORREF iconCol = active ? RGB(0xFF, 0xFF, 0xFF) : (hover ? C_TXT : C_CAPICON);
+    Gdiplus::Color col(255, GetRValue(iconCol), GetGValue(iconCol), GetBValue(iconCol));
+    Gdiplus::Color bg(255, GetRValue(bgCol), GetGValue(bgCol), GetBValue(bgCol));
+    float cx = (rc.left + rc.right) / 2.0f;
+    float cy = (rc.top + rc.bottom) / 2.0f;
+    float sz = (rc.right - rc.left) * 0.24f;
+    if (kind == 0) DrawHomeIcon(g, cx, cy, sz, col);
+    else DrawGearIcon(g, cx, cy, sz, col, bg);
+}
+
+static void DrawSidebar(HDC dc, HWND hwnd) {
+    RECT full;
+    GetClientRect(hwnd, &full);
+    RECT sidebar = { 0, g_capH, g_sidebarW, full.bottom };
+    HBRUSH b = CreateSolidBrush(C_BG);
+    FillRect(dc, &sidebar, b);
+    DeleteObject(b);
+
+    HPEN pen = CreatePen(PS_SOLID, 1, C_EDGE);
+    HGDIOBJ op = SelectObject(dc, pen);
+    MoveToEx(dc, g_sidebarW, g_capH, NULL);
+    LineTo(dc, g_sidebarW, full.bottom);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+
+    DrawNavIcon(dc, g_navHomeR, 0, g_view == VIEW_DASHBOARD, g_hoverNav == 0);
+    DrawNavIcon(dc, g_navGearR, 1, g_view == VIEW_SETTINGS, g_hoverNav == 1);
 }
 
 // The window has no native frame at all (WS_POPUP, no WS_CAPTION) so DWM
@@ -610,7 +741,10 @@ static void PaintMain(HWND hwnd) {
             DT_LEFT | DT_SINGLELINE);
 
     // Status row
-    COLORREF dotCol = paused ? C_AMB
+    bool updateFailed;
+    { std::lock_guard<std::mutex> lk(g_updateMu); updateFailed = g_updateFailed; }
+    COLORREF dotCol = updateFailed ? C_RED
+                     : paused ? C_AMB
                      : (statusKind == STATUS_ERROR ? C_RED
                         : statusKind == STATUS_WAITING ? C_AMB : C_GOLD);
     int dotSize = (int)(8.0 * g_dpi / 96.0 * g_sizeScale);
@@ -627,7 +761,7 @@ static void PaintMain(HWND hwnd) {
     RECT statusText = g_layout.statusL;
     statusText.left += dotSize + (int)(8.0 * g_dpi / 96.0 * g_sizeScale);
     std::wstring updateStatus;
-    { std::lock_guard<std::mutex> lk(g_updateMu); if (g_updating) updateStatus = g_updateStatus; }
+    { std::lock_guard<std::mutex> lk(g_updateMu); if (g_updating || g_updateFailed) updateStatus = g_updateStatus; }
     std::wstring statusLine = !updateStatus.empty() ? updateStatus
                              : paused ? L"Paused" : (status.empty() ? L"Starting\x2026" : status);
     DrawTxt(mem, statusText, statusLine.c_str(), g_fSub, dotCol, DT_LEFT | DT_SINGLELINE);
@@ -639,13 +773,13 @@ static void PaintMain(HWND hwnd) {
             DT_RIGHT | DT_SINGLELINE);
 
     // Buttons
-    DrawButton(mem, g_layout.btnSet, L"Settings", g_hover == 0, g_btnDown == 0);
     DrawButton(mem, g_layout.btnPause, paused ? L"Resume" : L"Pause",
-               g_hover == 1, g_btnDown == 1);
-    DrawButton(mem, g_layout.btnRefresh, L"Refresh", g_hover == 3, g_btnDown == 3);
-    DrawButton(mem, g_layout.btnOpen, L"Open output", g_hover == 2, g_btnDown == 2);
+               g_hover == ACT_PAUSE, g_btnDown == ACT_PAUSE);
+    DrawButton(mem, g_layout.btnRefresh, L"Refresh", g_hover == ACT_REFRESH, g_btnDown == ACT_REFRESH);
+    DrawButton(mem, g_layout.btnOpen, L"Open output", g_hover == ACT_OPEN, g_btnDown == ACT_OPEN);
 
     DrawCaption(mem, hwnd);
+    DrawSidebar(mem, hwnd);
     if (g_updateAvailable) DrawUpdateBadge(mem);
     DrawActiveBorder(mem, hwnd);
 
@@ -661,23 +795,38 @@ static void PaintSettingsBg(HWND hwnd) {
     HDC dc = BeginPaint(hwnd, &ps);
     RECT rc;
     GetClientRect(hwnd, &rc);
+    int W = rc.right, H = rc.bottom;
+
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, W, H);
+    HGDIOBJ oldB = SelectObject(mem, bmp);
+
     EnsureFonts(hwnd);
     ComputeCaptionRects(hwnd);
-    FillRect(dc, &rc, g_brDlg);
-    DrawCaption(dc, hwnd);
-    if (g_updateAvailable) DrawUpdateBadge(dc);
-    DrawActiveBorder(dc, hwnd);
+    FillRect(mem, &rc, g_brDlg);
+
+    double s = UiScale(hwnd);
+    RECT header = { g_sidebarW + (int)(14 * s), g_capH + (int)(12 * s),
+                    rc.right - (int)(14 * s), g_capH + (int)(12 * s) + (int)(24 * s) };
+    DrawTxt(mem, header, L"Settings", g_fValue, C_TXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DrawCaption(mem, hwnd);
+    DrawSidebar(mem, hwnd);
+    if (g_updateAvailable) DrawUpdateBadge(mem);
+    DrawActiveBorder(mem, hwnd);
+
+    BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldB);
+    DeleteObject(bmp);
+    DeleteDC(mem);
     EndPaint(hwnd, &ps);
 }
 
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
-enum { ACT_NONE = -1, ACT_SETTINGS = 0, ACT_PAUSE = 1, ACT_OPEN = 2, ACT_REFRESH = 3 };
-
 static int HitTest(int x, int y) {
     POINT p = { x, y };
-    if (PtInRect(&g_layout.btnSet, p)) return ACT_SETTINGS;
     if (PtInRect(&g_layout.btnPause, p)) return ACT_PAUSE;
     if (PtInRect(&g_layout.btnRefresh, p)) return ACT_REFRESH;
     if (PtInRect(&g_layout.btnOpen, p)) return ACT_OPEN;
@@ -727,6 +876,7 @@ static void StartUpdateDownload() {
         std::lock_guard<std::mutex> lk(g_updateMu);
         if (g_updating || !g_updateAvailable) return;
         g_updating = true;
+        g_updateFailed = false;
         g_updateStatus = L"Downloading update\x2026";
         info = g_updateInfo;
     }
@@ -762,7 +912,8 @@ static void StartUpdateDownload() {
         } else {
             std::lock_guard<std::mutex> lk(g_updateMu);
             g_updating = false;
-            g_updateStatus = L"Update failed \x2014 try again later";
+            g_updateFailed = true;
+            g_updateStatus = L"Update failed \x2014 see gx_update.log, click Update to retry";
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPDATE_PROGRESS, 0, 0);
         }
     }).detach();
@@ -961,23 +1112,25 @@ static void PositionSettingsControls(HWND hwnd) {
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
     int capH = g_capH;
+    int left = g_sidebarW + pad;
+    int rowW = W - left - pad;
 
     double fy = std::clamp((double)(H - capH - 40 * s) / (320 * s), 0.7, 1.0);
     int rowH = (int)((14 + 4 + 24 + 6) * s * fy);
 
-    int backH = (int)(28 * s);
-    MoveWindow(GetDlgItem(hwnd, IDC_BTN_BACK), pad, capH + (int)(10 * s),
-               (int)(72 * s), backH, TRUE);
-
-    int y = capH + (int)(10 * s) + backH + (int)(8 * s);
+    // "Settings" header occupies the first row's worth of space; fields
+    // start right below it (no more separate Back button -- the sidebar's
+    // Home icon returns to the dashboard).
+    int headerH = (int)(24 * s);
+    int y = capH + (int)(12 * s) + headerH + (int)(10 * s);
 
     auto Row = [&](int lbl, int ed, int btn, int btnW) {
-        MoveWindow(GetDlgItem(hwnd, lbl), pad, y, W - 2 * pad, (int)(14 * s), TRUE);
+        MoveWindow(GetDlgItem(hwnd, lbl), left, y, rowW, (int)(14 * s), TRUE);
         int ey = y + (int)(18 * s);
-        int ew = W - 2 * pad;
-        if (btn) ew = W - 2 * pad - btnW - (int)(10 * s);
-        MoveWindow(GetDlgItem(hwnd, ed), pad, ey, ew, (int)(24 * s), TRUE);
-        if (btn) MoveWindow(GetDlgItem(hwnd, btn), pad + ew + (int)(10 * s),
+        int ew = rowW;
+        if (btn) ew = rowW - btnW - (int)(10 * s);
+        MoveWindow(GetDlgItem(hwnd, ed), left, ey, ew, (int)(24 * s), TRUE);
+        if (btn) MoveWindow(GetDlgItem(hwnd, btn), left + ew + (int)(10 * s),
                             ey, btnW, (int)(24 * s), TRUE);
         y += rowH;
     };
@@ -987,11 +1140,11 @@ static void PositionSettingsControls(HWND hwnd) {
     Row(IDC_LBL_OUT, IDC_ED_OUT, IDC_BTN_BROWSE_OUT, (int)(88 * s));
     Row(IDC_LBL_POLL, IDC_ED_POLL, 0, 0);
 
-    MoveWindow(GetDlgItem(hwnd, IDC_CHK_RAW), pad, y, W - 2 * pad, (int)(22 * s), TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_CHK_RAW), left, y, rowW, (int)(22 * s), TRUE);
     y += (int)(26 * s);
-    MoveWindow(GetDlgItem(hwnd, IDC_CHK_MIN), pad, y, W - 2 * pad, (int)(22 * s), TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_CHK_MIN), left, y, rowW, (int)(22 * s), TRUE);
     y += (int)(26 * s);
-    MoveWindow(GetDlgItem(hwnd, IDC_CHK_RUN), pad, y, W - 2 * pad, (int)(22 * s), TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_CHK_RUN), left, y, rowW, (int)(22 * s), TRUE);
     y += (int)(30 * s);
 
     int bw = (int)(110 * s), bh = (int)(30 * s);
@@ -1036,6 +1189,7 @@ static void PositionOutputPath(HWND hwnd) {
     double s = UiScale(hwnd);
     int W = rc.right, H = rc.bottom;
     int pad = (int)(14 * s);
+    int left = g_sidebarW + pad;
 
     int btnW = (int)(70 * s);
     int hh   = (int)(24 * s);
@@ -1044,13 +1198,13 @@ static void PositionOutputPath(HWND hwnd) {
 
     HWND hEd  = GetDlgItem(hwnd, IDC_ED_OUTPATH);
     HWND hBtn = GetDlgItem(hwnd, IDC_BTN_COPY);
-    if (hEd)  MoveWindow(hEd,  pad, y, W - 2 * pad - btnW - (int)(8 * s), hh, TRUE);
+    if (hEd)  MoveWindow(hEd,  left, y, W - left - pad - btnW - (int)(8 * s), hh, TRUE);
     if (hBtn) MoveWindow(hBtn, W - pad - btnW, y, btnW, hh, TRUE);
 }
 
 static void ShowSettingsChildren(int show) {
     const int ids[] = {
-        IDC_BTN_BACK, IDC_LBL_FILE, IDC_ED_FILE, IDC_BTN_BROWSE_GX,
+        IDC_LBL_FILE, IDC_ED_FILE, IDC_BTN_BROWSE_GX,
         IDC_LBL_ACCT, IDC_ED_ACCT, IDC_BTN_DETECT,
         IDC_LBL_OUT, IDC_ED_OUT, IDC_BTN_BROWSE_OUT,
         IDC_LBL_POLL, IDC_ED_POLL,
@@ -1106,8 +1260,6 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         AddTrayIcon();
 
         RECT r{ 0, 0, 100, 24 };
-        MakeChild(hwnd, L"BUTTON", L"\x2039 Back", WS_TABSTOP | BS_OWNERDRAW, 0,
-                  IDC_BTN_BACK, &r, g_fntUi, false);
         MakeChild(hwnd, L"STATIC",
                   L"SAVED VARIABLES \x2014 GX.lua  (empty = auto-detect)",
                   SS_LEFT, 0, IDC_LBL_FILE, &r, g_fntUi, false);
@@ -1219,9 +1371,6 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int id = LOWORD(wp);
         if (HIWORD(wp) != BN_CLICKED) break;
         switch (id) {
-        case IDC_BTN_BACK:
-            HideSettingsView();
-            break;
         case IDC_BTN_SAVE:
             ApplySettings();
             HideSettingsView();
@@ -1270,6 +1419,8 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (ch != g_hoverCap) { g_hoverCap = ch; changed = true; }
         bool uh = UpdateBadgeHit(mx, my);
         if (uh != g_hoverUpdate) { g_hoverUpdate = uh; changed = true; }
+        int nh = NavHitTest(mx, my);
+        if (nh != g_hoverNav) { g_hoverNav = nh; changed = true; }
         if (g_view != VIEW_SETTINGS) {
             int h = HitTest(mx, my);
             if (h != g_hover) { g_hover = h; changed = true; }
@@ -1281,11 +1432,12 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSELEAVE:
-        if (g_hover != -1 || g_btnDown != -1 || g_hoverCap != -1 || g_hoverUpdate) {
+        if (g_hover != -1 || g_btnDown != -1 || g_hoverCap != -1 || g_hoverUpdate || g_hoverNav != -1) {
             g_hover = -1;
             g_btnDown = -1;
             g_hoverCap = -1;
             g_hoverUpdate = false;
+            g_hoverNav = -1;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
@@ -1301,6 +1453,13 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int ch = CapHitTest(mx, my);
         if (ch != -1) {
             g_capDown = ch;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        int nh = NavHitTest(mx, my);
+        if (nh != -1) {
+            g_navDown = nh;
             SetCapture(hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
@@ -1337,6 +1496,17 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        if (g_navDown != -1) {
+            int down = g_navDown;
+            g_navDown = -1;
+            ReleaseCapture();
+            if (NavHitTest(mx, my) == down) {
+                if (down == 0) HideSettingsView();
+                else ShowSettingsView();
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (g_view == VIEW_SETTINGS) return 0;
         if (g_btnDown != ACT_NONE) {
             int down = g_btnDown;
@@ -1344,7 +1514,6 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ReleaseCapture();
             if (HitTest(mx, my) == down) {
                 switch (down) {
-                case ACT_SETTINGS: ShowSettingsView(); break;
                 case ACT_PAUSE: TogglePause(); UpdateTrayTip(); break;
                 case ACT_REFRESH: DoRefresh(); break;
                 case ACT_OPEN: OpenOutputFile(); break;
@@ -1359,6 +1528,7 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btnDown = ACT_NONE;
         g_capDown = -1;
         g_updateDown = false;
+        g_navDown = -1;
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
 
@@ -1422,11 +1592,20 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         break;
 
-    case WM_KILLFOCUS:
-        g_windowActive = false;
-        SetBorderActive(hwnd, false);
-        InvalidateRect(hwnd, NULL, FALSE);
+    case WM_KILLFOCUS: {
+        // wp is the window RECEIVING focus. Settings-view fields live as
+        // child controls of this same window (e.g. ShowSettingsView calls
+        // SetFocus on the file-path edit box) -- that's focus moving within
+        // our own app, not the app losing focus, so only treat it as
+        // deactivation when focus genuinely leaves our window hierarchy.
+        HWND next = (HWND)wp;
+        if (!next || !(next == hwnd || IsChild(hwnd, next))) {
+            g_windowActive = false;
+            SetBorderActive(hwnd, false);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         break;
+    }
 
     case WM_NCPAINT:
         // The window keeps WS_CAPTION (for DWM's shadow/rounded corners and
@@ -1467,7 +1646,7 @@ static LRESULT CALLBACK GoldWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HFONT oldUi = g_fntUi;
         g_fntUi = MakeFontPt(9, FW_NORMAL);
         const int uiFontIds[] = {
-            IDC_BTN_BACK, IDC_LBL_FILE, IDC_ED_FILE, IDC_BTN_BROWSE_GX,
+            IDC_LBL_FILE, IDC_ED_FILE, IDC_BTN_BROWSE_GX,
             IDC_LBL_ACCT, IDC_ED_ACCT, IDC_BTN_DETECT,
             IDC_LBL_OUT, IDC_ED_OUT, IDC_BTN_BROWSE_OUT,
             IDC_LBL_POLL, IDC_ED_POLL,
@@ -1568,8 +1747,13 @@ int RunApp(HINSTANCE hinst) {
     // behavior working. No WS_MAXIMIZEBOX: the window can't be
     // full-screened (no maximize button, no double-click-caption maximize,
     // no Win+Up / drag-to-top snap).
+    // WS_CLIPCHILDREN: without it, the parent's own paint DC isn't clipped
+    // around the settings-view child controls (edit boxes, buttons), so
+    // every background repaint (e.g. from a hover state change while the
+    // mouse sits over the sidebar) draws straight over them; they then
+    // redraw themselves a frame later, which reads as a visible flicker.
     g_hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"GXGoldWnd", L"GX Gold Export",
-                             WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX,
+                             WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              (int)(520 * s), (int)(470 * s),
                              NULL, NULL, hinst, NULL);
